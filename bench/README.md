@@ -91,7 +91,8 @@ Throughput, CPU and coordinator busy time are always measured over the same wind
 | Uncertain | 10 | 0 | 0 | 0 |
 
 \* Run 1 was slowed by other load on the laptop. For its first 80 seconds it held about
-2,750 pages/s at the same CPU use per page, then rose to about 4,000. The longest window
+2,750 pages/s, using about 0.58 ms of crawler CPU per page against 0.36–0.38 ms in runs
+2–4, then rose to about 4,000. The longest window
 above 50% of peak therefore fell in the slow stretch. I ran a fourth run instead of
 discarding it. The median of the four steady rates is 4,026 pages/s. Without run 1 it is
 4,034.
@@ -164,8 +165,8 @@ a window edge can push it slightly above 100%.
 
 The frontier alone (no network, parsing or storage) handled 100,000 hosts × 50 pages with a
 2 s delay and 200 ms requests. It made 5,000,000 scheduling decisions in 3.5 s, about 1.4
-million per second, in 61 MiB (`scheduler-100k.json`). Across today's runs this figure
-varied between 0.7 and 1.4 million per second with machine load. This measures the cost of choosing
+million per second, in 61 MiB (`scheduler-100k.json`). Earlier runs today, not archived,
+measured as low as 0.7 million per second while the machine was busier. This measures the cost of choosing
 what to fetch next. It is not a crawl rate.
 
 ## What breaks first
@@ -177,7 +178,7 @@ what to fetch next. It is not a crawl rate.
    - commit outcomes in batches, one transaction per batch instead of per page;
    - shard hosts across several coordinators. Hosts share no state, so they split cleanly.
 2. **Memory per URL queued.** Peak memory grows with the URLs known: 0.9 GiB at 10,000
-   hosts, 4.6 GiB at 40,000. The frontier holds every pending URL as a string. A
+   hosts, 4.5 GiB at 40,000. The frontier holds every pending URL as a string. A
    disk-backed frontier or interned URLs are needed long before a real-web crawl.
 3. **One SQLite file.** It held about 4,000 page outcomes per second here, each in its own
    transaction (plus a small per-request host-hold write), with WAL and
@@ -194,8 +195,7 @@ what to fetch next. It is not a crawl rate.
 - **The simulator is kind.** Pages are well-formed, nothing needs JavaScript, and hosts
   never ban the crawler. Latency follows a fixed distribution.
 - **One laptop, WSL2.** Steady throughput moved 1% across runs 2–4. Run 1 was 32% lower
-  while other load ran (see above), and the scheduler-only figure moved by 2x across the
-  day. The machine was not otherwise idle.
+  while other load ran (see above). The machine was not otherwise idle.
 - **Politeness sets the ceiling.** With a 2 s delay per host, 100 million pages a day needs
   about 2,300 hosts with work at every moment. Most of the real difficulty is the frontier:
   deciding which hosts and pages to keep busy.
