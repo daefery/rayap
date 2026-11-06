@@ -1,0 +1,30 @@
+# Public pages that track the National Geographic Society "The Human Thread" grant
+# (sources S1-S5 in lampalampa/grant/PLAN.md). Public pages only: rayap never logs in.
+
+[crawler]
+contact = "https://github.com/daefery/rayap"
+per_host_delay_ms = 5000
+
+[[source]]
+name = "ngs-grants"
+url = "https://www.nationalgeographic.org/explore/grants-investments"
+
+[[source]]
+name = "ngs-ai-policy"
+url = "https://www.nationalgeographic.org/ai-responsibility-policy"
+
+[[source]]
+name = "uva-human-thread"
+url = "https://cfr.virginia.edu/faculty-staff/funding-opportunities/human-thread-program"
+
+[[source]]
+name = "terraviva-human-thread"
+url = "https://www.terravivagrants.org/national-geographic-society-the-human-thread/"
+
+[[source]]
+name = "newsfuel-739"
+url = "https://newsfuel.org/opportunities/739"
+
+[[source]]
+name = "andpurpose-human-thread"
+url = "https://andpurpose.world/national-geographic-society-the-human-thread-2026/"
