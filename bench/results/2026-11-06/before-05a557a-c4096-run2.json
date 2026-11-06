@@ -1,7 +1,7 @@
 {
-  "crawler_cpu_cores_avg": 0.67,
-  "crawler_cpu_seconds": 197.59,
-  "crawler_peak_rss_mib": 1625.59,
+  "crawler_cpu_cores_avg": 0.7,
+  "crawler_cpu_seconds": 196.0,
+  "crawler_peak_rss_mib": 1851.73,
   "events": {
     "blocked": 18315,
     "gone": 3932,
@@ -18,12 +18,12 @@
   "mode": "e2e",
   "pages_ok": 395715,
   "pages_per_second": {
-    "overall": 1338.27,
-    "peak_1s": 2364,
-    "steady_state_mean": 1862.19,
-    "steady_state_p10": 1575,
-    "steady_state_p50": 1773,
-    "steady_window_seconds": 209
+    "overall": 1413.0,
+    "peak_1s": 2558,
+    "steady_state_mean": 2068.34,
+    "steady_state_p10": 1946,
+    "steady_state_p50": 2035,
+    "steady_window_seconds": 188
   },
   "params": {
     "concurrency": 4096,
@@ -37,8 +37,8 @@
     "aborted": 0,
     "bytes_sent": 12148329280,
     "details": [],
-    "end_window_ms_max": 2.356,
-    "end_window_ms_mean": 0.00003187630772457116,
+    "end_window_ms_max": 3.616,
+    "end_window_ms_mean": 0.01827162779835185,
     "hosts_contacted": 10000,
     "min_gap_slack_ms": 0,
     "requests": 419622,
@@ -57,11 +57,11 @@
       "too_soon": 0
     }
   },
-  "seconds_to_90pct_of_pages": 197.0,
+  "seconds_to_90pct_of_pages": 177.0,
   "stats": {
     "bytes": 12148054785,
     "events": 421819,
     "requests": 409530
   },
-  "wall_seconds": 295.69
+  "wall_seconds": 280.05
 }

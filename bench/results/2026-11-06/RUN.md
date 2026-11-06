@@ -1,20 +1,19 @@
 # How these results were produced (6 Nov 2026)
 
 All runs were on one machine, one after another, from the repository root. The code was
-at `268fb3d`. Files show `268fb3d-dirty` because the result files themselves were not yet
-committed; `git diff 268fb3d -- crates Cargo.toml Cargo.lock` was empty. Each e2e JSON
+at `2d0a321`, as recorded in each file. Each e2e JSON
 records `provenance.rayap_revision`, the exact simulator command, the resolved simulator
 spec and the crawler settings.
 
 | File | Command |
 |---|---|
-| `e2e-10k-run{1,2,3}.json` | `rayap-bench e2e --hosts 10000 --delay-ms 2000 --concurrency 8192 --max-seconds 900` |
+| `e2e-10k-run{1,2,3,4}.json` (run 4 added because other load slowed run 1) | `rayap-bench e2e --hosts 10000 --delay-ms 2000 --concurrency 8192 --max-seconds 900` |
 | `e2e-sweep-{2500,5000,20000,40000}.json` | same with `--hosts N` (one run each) |
 | `scheduler-100k.json` | `rayap-bench scheduler --hosts 100000 --pages-per-host 50 --delay-ms 2000 --request-ms 200 --in-flight 100000` |
 | `e2e-10k-flamegraph.json`, `flamegraph-after.svg` | the 10k command with `--flamegraph` (the profiler adds load; not used for throughput) |
 | `negative-control-crawler-{1950,1990}ms.json` | the 10k command with `--crawler-delay-ms N`: the referee enforces 2,000 ms while rayap waits N |
 | `after-c4096-run{1,2}.json` | `rayap-bench e2e --hosts 10000 --delay-ms 2000 --concurrency 4096 --max-seconds 900` |
-| `before-05a557a-c4096-run{1,2}.json` | the same command, using `rayap-bench` built at commit `05a557a` (before the optimisation), with `--sim-bin` pointing at the simulator built at `268fb3d`, so both versions face the same referee. Runs alternated: before 1, after 1, before 2, after 2 |
+| `before-05a557a-c4096-run{1,2}.json` | the same command, using `rayap-bench` built at commit `05a557a` (before the optimisation), with `--sim-bin` pointing at the simulator built at `2d0a321`, so both versions face the same referee. Runs alternated: before 1, after 1, before 2, after 2 |
 | `before-05a557a-flamegraph.json`, `flamegraph-before.svg` | the before binary with `--flamegraph`, same simulator |
 
 The `05a557a` bench binary predates the provenance fields, so its JSON files have no
