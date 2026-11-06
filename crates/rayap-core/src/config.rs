@@ -41,6 +41,10 @@ pub struct CrawlerConfig {
     /// Attempts per URL before a retryable failure becomes an `error` event.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
+    /// Longest a run waits for a held host (Retry-After, backoff). Beyond this the run ends
+    /// unfinished; the hold is stored and the next run resumes the remaining pages.
+    #[serde(default = "default_max_wait_ms")]
+    pub max_wait_ms: u64,
     /// Wait after a network error or 5xx before retrying, multiplied by the attempt number.
     #[serde(default = "default_retry_backoff_ms")]
     pub retry_backoff_ms: u64,
@@ -76,6 +80,9 @@ fn default_max_body_bytes() -> usize {
 }
 fn default_max_attempts() -> u32 {
     3
+}
+fn default_max_wait_ms() -> u64 {
+    10 * 60 * 1000
 }
 fn default_retry_backoff_ms() -> u64 {
     30_000
@@ -146,6 +153,10 @@ impl Config {
 
     pub fn max_crawl_delay(&self) -> Duration {
         Duration::from_millis(self.crawler.max_crawl_delay_ms)
+    }
+
+    pub fn max_wait(&self) -> Duration {
+        Duration::from_millis(self.crawler.max_wait_ms)
     }
 
     pub fn retry_backoff(&self) -> Duration {

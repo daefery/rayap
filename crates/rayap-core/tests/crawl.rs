@@ -622,3 +622,47 @@ async fn endless_redirect_chains_stop() {
     assert_eq!(events.last().unwrap().kind, EventKind::Error);
     assert!(site.requests().len() <= 12, "robots.txt + at most 11 hops");
 }
+
+#[tokio::test]
+async fn huge_retry_after_ends_the_run_without_panicking() {
+    let site = Site::default();
+    site.set(
+        "/",
+        Reply::TooManyRequests {
+            retry_after: "18446744073709551615",
+            times: 5,
+        },
+    );
+    let addr = start(site.clone()).await;
+    let mut store = Store::open_in_memory().unwrap();
+    let (stats, events) = run(&config(addr, 0, 0), &mut store, Options::default()).await;
+    assert!(!stats.finished, "the page stays pending for a later run");
+    assert!(events.is_empty());
+    assert_eq!(site.requests(), ["/robots.txt", "/"]);
+}
+
+#[tokio::test]
+async fn cross_host_robots_redirect_applies_crawl_delay_to_the_origin() {
+    let site = Site::default();
+    let other = Site::default();
+    let other_addr = start(other.clone()).await;
+    other.set(
+        "/rules.txt",
+        Reply::Text("User-agent: *\nCrawl-delay: 1\n".into()),
+    );
+    site.set(
+        "/robots.txt",
+        Reply::Redirect(format!("http://localhost:{}/rules.txt", other_addr.port())),
+    );
+    site.set("/", Reply::Html("<p>x</p>".into()));
+    let addr = start(site.clone()).await;
+    let mut store = Store::open_in_memory().unwrap();
+    run(&config(addr, 0, 0), &mut store, Options::default()).await;
+    let times = site.times();
+    assert_eq!(site.requests(), ["/robots.txt", "/"]);
+    let rules_at = other.times()[0];
+    assert!(
+        times[1] - rules_at >= std::time::Duration::from_millis(1000),
+        "page fetched before the origin's Crawl-delay"
+    );
+}

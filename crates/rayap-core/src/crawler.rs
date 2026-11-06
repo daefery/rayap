@@ -31,6 +31,8 @@ const SLOW_DOWN_DEFAULT: Duration = Duration::from_secs(60);
 const MAX_ROBOTS_HOPS: u32 = 5;
 /// Redirects followed from one source URL before the chain is reported as an error.
 const MAX_PAGE_HOPS: u32 = 10;
+/// Longest hold rayap represents; a longer Retry-After is treated as this long.
+const MAX_HOLD: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -152,7 +154,6 @@ pub async fn crawl<F: FnMut(&Event)>(
     let clients = Arc::new(Clients::new(config)?);
     let sources: Vec<&str> = config.sources.iter().map(|s| s.name.as_str()).collect();
     let (run, resumed) = store.begin_run(&sources)?;
-    let now = Instant::now();
     let mut seed_hosts = HashMap::new();
     for source in &config.sources {
         let url = urlnorm::normalize(&source.url, None).expect("validated in Config");
@@ -186,10 +187,11 @@ pub async fn crawl<F: FnMut(&Event)>(
         on_event,
     };
 
-    let now_ms = unix_now_ms();
+    // Sample both clocks together so a stored hold is not shortened by setup time.
+    let (now, now_ms) = (Instant::now(), unix_now_ms());
     for (host, until_ms) in crawler.store.active_holds()? {
         let wait = Duration::from_millis(u64::try_from(until_ms - now_ms).unwrap_or(0));
-        crawler.frontier.hold(&host, now + wait, now);
+        crawler.frontier.hold(&host, now + wait.min(MAX_HOLD), now);
     }
     for p in crawler.store.pending(run)? {
         if !config.sources.iter().any(|s| s.name == p.source) {
@@ -260,9 +262,12 @@ pub async fn crawl<F: FnMut(&Event)>(
             }
         }
 
+        let too_far = wake.is_some_and(|at| at > Instant::now() + config.max_wait());
         if crawler.in_flight == 0
-            && (wake.is_none() || crawler.fetch_budget_spent(options.max_fetches))
+            && (wake.is_none() || too_far || crawler.fetch_budget_spent(options.max_fetches))
         {
+            // Nothing in flight and nothing to do soon. Held hosts keep their stored holds
+            // and their pages stay pending, so the next run picks them up.
             break;
         }
 
@@ -416,8 +421,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 result,
             } => {
                 let wait = self.handle_page(&host, page, &url, result, now)?;
-                self.frontier.release(&host, now, wait);
-                Ok(())
+                self.release(&host, now, wait)
             }
         }
     }
@@ -440,8 +444,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                     hops: hops + 1,
                 };
                 self.frontier.push_front(&urlnorm::host(&target), work, now);
-                self.frontier.release(host, now, delay);
-                return Ok(());
+                return self.release(host, now, delay);
             }
             RobotsResult::Redirect(_) => {
                 // Too many redirects (or no Location): treat as unavailable, RFC 9309 §2.3.1.2.
@@ -453,7 +456,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 retry_after,
             } => {
                 if let Some(wait) = retry_after {
-                    self.hold(host, now + wait, now)?;
+                    self.hold(host, now, wait)?;
                 }
                 robots::interpret(status, &body, &self.config.crawler.product_token)
             }
@@ -487,7 +490,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                     .frontier
                     .delay(&origin_host)
                     .max(self.config.retry_backoff() * failures);
-                self.hold(&origin_host, now + wait, now)?;
+                self.hold(&origin_host, now, wait)?;
                 self.robots.insert(
                     origin.clone(),
                     RobotsState::Unreachable {
@@ -508,9 +511,14 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             self.frontier
                 .push_front(&origin_host, Work::Page(page), now);
         }
+        if origin_host != host {
+            // robots.txt was served from another host after a redirect. The origin's host was
+            // last contacted at the first hop; its (possibly new) Crawl-delay counts from now.
+            let origin_delay = self.frontier.delay(&origin_host);
+            self.hold(&origin_host, now, origin_delay)?;
+        }
         let delay = self.frontier.delay(host);
-        self.frontier.release(host, now, delay);
-        Ok(())
+        self.release(host, now, delay)
     }
 
     /// A host's delay is the configured delay or the largest Crawl-delay of its origins.
@@ -527,11 +535,21 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         self.frontier.set_delay(host, delay, now);
     }
 
-    fn hold(&mut self, host: &str, until: Instant, now: Instant) -> Result<()> {
-        self.frontier.hold(host, until, now);
-        let ms =
-            i64::try_from(until.saturating_duration_since(now).as_millis()).unwrap_or(i64::MAX / 2);
+    /// Keeps `host` from being contacted for `wait` after `now`, in memory and in the store,
+    /// so a restart honours it too. Earlier holds that end later are kept.
+    fn hold(&mut self, host: &str, now: Instant, wait: Duration) -> Result<()> {
+        let wait = wait.min(MAX_HOLD);
+        self.frontier.hold(host, now + wait, now);
+        let ms = i64::try_from(wait.as_millis()).unwrap_or(i64::MAX / 4);
         self.store.hold_host(host, unix_now_ms().saturating_add(ms))
+    }
+
+    /// Ends a request to `host`: the host may be contacted again after `wait` (or later if
+    /// held). The time is stored so a restart cannot shorten it.
+    fn release(&mut self, host: &str, now: Instant, wait: Duration) -> Result<()> {
+        self.hold(host, now, wait)?;
+        self.frontier.release(host, now, Duration::ZERO);
+        Ok(())
     }
 
     /// Records the page outcome and returns how long the host must rest before its next request.
@@ -611,7 +629,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             } => {
                 let wait = retry_after.unwrap_or(SLOW_DOWN_DEFAULT).max(delay);
                 // The host is held for the full time the server asked for, whatever happens to this page.
-                self.hold(host, now + wait, now)?;
+                self.hold(host, now, wait)?;
                 if page.attempts + 1 >= self.config.crawler.max_attempts {
                     let detail = format!(
                         "HTTP {status}, gave up after {} attempts",
@@ -701,9 +719,10 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             )?;
             return Ok(delay);
         }
+        let wait = delay.max(self.config.retry_backoff() * (page.attempts + 1));
+        // Hold first: if the process stops between the two writes, the host still waits.
+        self.hold(host, now, wait)?;
         self.retry(host, &mut page, now)?;
-        let wait = delay.max(self.config.retry_backoff() * page.attempts);
-        self.hold(host, now + wait, now)?;
         Ok(wait)
     }
 

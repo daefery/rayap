@@ -231,9 +231,10 @@ fn make_rule(allow: bool, value: &[u8]) -> Option<Rule> {
     if anchored {
         pattern.pop();
     }
-    // Collapse runs of `*`; they match the same strings and only cost time.
-    pattern.dedup_by(|a, b| *a == b'*' && *b == b'*');
+    // Precedence uses the pattern as written (RFC 9309 §2.2.2), so measure before
+    // collapsing runs of `*` (which match the same strings and only cost time).
     let priority = pattern.len() + usize::from(anchored);
+    pattern.dedup_by(|a, b| *a == b'*' && *b == b'*');
     if pattern.len() > MAX_PATTERN_BYTES {
         if allow {
             return None;
@@ -371,6 +372,12 @@ mod tests {
         assert!(!r.allowed("/grants/closed"));
         let tie = rules("User-agent: *\nDisallow: /page\nAllow: /page\n");
         assert!(tie.allowed("/page"));
+    }
+
+    #[test]
+    fn precedence_counts_repeated_stars_as_written() {
+        let r = rules("User-agent: *\nDisallow: /a**\nAllow: /a*\n");
+        assert!(!r.allowed("/abc"), "the longer disallow pattern wins");
     }
 
     #[test]

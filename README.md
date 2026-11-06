@@ -24,7 +24,9 @@ interrupted crawl resumes where it stopped and the next run reports only what ch
   never widen access. `Crawl-delay` is honoured per origin, capped by `max_crawl_delay_ms`.
 - **Backs off when asked**: `429` and `503` hold the whole host for the full `Retry-After`
   (seconds or HTTP date); network errors and other 5xx retry with growing backoff, up to
-  `max_attempts`. Holds are stored, so a restart never contacts a host early.
+  `max_attempts`. Every wait is stored, so a restart never contacts a host early. If the
+  only remaining work is further away than `max_wait_ms` (default 10 minutes), the run ends
+  unfinished and the next run resumes it.
 - **Redirects are not followed blindly**: the target is queued as its own page, so it passes
   robots.txt and politeness checks for its own host. Chains stop after 10 hops, and links are
   only followed on the source's own host.

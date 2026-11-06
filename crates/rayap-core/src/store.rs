@@ -180,10 +180,12 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(SCHEMA)?;
+        let tx = conn.transaction()?;
+        migrate(&tx)?;
+        tx.commit()?;
         Ok(Self { conn })
     }
 
@@ -326,6 +328,33 @@ impl Store {
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
+}
+
+/// Schema version stored in `PRAGMA user_version`.
+const SCHEMA_VERSION: i64 = 2;
+
+/// Brings any older database up to `SCHEMA_VERSION`. Version 1 (the first release) had no
+/// `pages.hops` column and no `host_holds` table.
+fn migrate(tx: &Transaction) -> Result<()> {
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let has_pages: bool = tx.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'pages'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_pages && version < 2 {
+        let has_hops: bool = tx.query_row(
+            "SELECT count(*) > 0 FROM pragma_table_info('pages') WHERE name = 'hops'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_hops {
+            tx.execute_batch("ALTER TABLE pages ADD COLUMN hops INTEGER NOT NULL DEFAULT 0")?;
+        }
+    }
+    tx.execute_batch(SCHEMA)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
 }
 
 fn enqueue_in(conn: &Connection, run: i64, page: &NewPage) -> Result<bool> {
@@ -537,6 +566,36 @@ mod tests {
         s.finish_run(r1).unwrap();
         let (r2, _) = s.begin_run(&["new"]).unwrap();
         assert!(s.pending(r2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_1_database_is_upgraded_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE runs (id INTEGER PRIMARY KEY, started_at INTEGER NOT NULL, finished_at INTEGER);
+                 CREATE TABLE pages (url TEXT PRIMARY KEY, source TEXT NOT NULL, depth INTEGER NOT NULL,
+                     queued_run INTEGER NOT NULL, done_run INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+                     status INTEGER, etag TEXT, last_modified TEXT, content_hash TEXT, title TEXT,
+                     fetched_at INTEGER);
+                 CREATE TABLE events (id INTEGER PRIMARY KEY, run INTEGER NOT NULL, at INTEGER NOT NULL,
+                     source TEXT NOT NULL, url TEXT NOT NULL, kind TEXT NOT NULL, status INTEGER,
+                     title TEXT, hash TEXT, prev_hash TEXT, bytes INTEGER, detail TEXT);
+                 INSERT INTO runs (id, started_at) VALUES (1, 0);
+                 INSERT INTO pages (url, source, depth, queued_run) VALUES ('https://a.org/', 'src', 0, 1);
+                 INSERT INTO events (run, at, source, url, kind) VALUES (1, 0, 'src', 'https://x.org/', 'new');",
+            )
+            .unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        let (run, resumed) = s.begin_run(&["src"]).unwrap();
+        assert!(resumed);
+        assert_eq!(s.pending(run).unwrap()[0].hops, 0);
+        assert_eq!(s.events_after(0, 10).unwrap().len(), 1, "old events kept");
+        drop(s);
+        Store::open(&path).unwrap(); // opening again is a no-op
     }
 
     #[test]

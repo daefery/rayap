@@ -190,6 +190,7 @@ async fn read_prefix(mut response: Response, limit: usize) -> std::result::Resul
 pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
     if let Ok(secs) = value.parse::<u64>() {
+        // Duration holds any u64 of seconds; callers cap the hold before adding it to a clock.
         return Some(Duration::from_secs(secs));
     }
     let at = httpdate::parse_http_date(value).ok()?;
