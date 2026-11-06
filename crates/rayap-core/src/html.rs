@@ -133,19 +133,57 @@ impl Extract {
     }
 }
 
+/// Collapses whitespace runs to one space and trims, in one pass.
 fn collapse(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Decodes the entities that commonly appear in titles and text, so that `&amp;` and `&`
-/// fingerprint the same. Other entities are kept as written.
+/// fingerprint the same. Other entities are kept as written. One pass; `&amp;lt;` becomes
+/// `&lt;` (decoded once), as a browser shows it.
 fn decode_basic_entities(s: &str) -> String {
-    s.replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
+    const ENTITIES: [(&str, char); 6] = [
+        ("&nbsp;", ' '),
+        ("&lt;", '<'),
+        ("&gt;", '>'),
+        ("&quot;", '"'),
+        ("&#39;", '\''),
+        ("&amp;", '&'),
+    ];
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        match ENTITIES.iter().find(|(e, _)| rest.starts_with(e)) {
+            Some((e, ch)) => {
+                out.push(*ch);
+                rest = &rest[e.len()..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -251,6 +289,21 @@ mod tests {
             "rayap",
         );
         assert_eq!(e.links[0].as_str(), "https://cdn.example.org/root/doc");
+    }
+
+    #[test]
+    fn text_cleanup() {
+        assert_eq!(collapse("  a \n\t b  c "), "a b c");
+        assert_eq!(collapse(""), "");
+        assert_eq!(
+            decode_basic_entities("A &amp; B &lt;x&gt; &quot;q&quot; it&#39;s&nbsp;ok"),
+            "A & B <x> \"q\" it's ok"
+        );
+        assert_eq!(
+            decode_basic_entities("&amp;lt; &copy; & &"),
+            "&lt; &copy; & &"
+        );
+        assert_eq!(decode_basic_entities("café"), "café");
     }
 
     #[test]

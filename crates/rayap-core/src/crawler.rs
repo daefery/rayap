@@ -23,7 +23,7 @@ use crate::fetch::{self, Clients, PageResult, RobotsResult};
 use crate::frontier::{Frontier, Next};
 use crate::robots::{self, Rules};
 use crate::store::{Event, EventKind, NewPage, Outcome, Store, unix_now_ms};
-use crate::{Config, Error, Result, html, urlnorm};
+use crate::{Config, Error, Result, urlnorm};
 
 /// Delay used for 429/503 without a usable Retry-After.
 const SLOW_DOWN_DEFAULT: Duration = Duration::from_secs(60);
@@ -67,6 +67,9 @@ pub struct Stats {
     pub bytes: u64,
     /// True when every queued page got an outcome and the run was closed.
     pub finished: bool,
+    /// Time the coordinator spent working (scheduling and recording), as opposed to waiting.
+    /// Close to the run's wall time means the coordinator is the bottleneck.
+    pub coordinator_busy: Duration,
 }
 
 /// A page waiting to be fetched.
@@ -136,7 +139,6 @@ enum Done {
     Page {
         host: String,
         page: Page,
-        url: Url,
         result: PageResult,
     },
 }
@@ -151,8 +153,8 @@ struct Crawler<'a, F: FnMut(&Event)> {
     waiting_for_robots: HashMap<String, Vec<Page>>,
     /// robots.txt failures so far in this run, for origins being fetched.
     robots_failures: HashMap<String, u32>,
-    /// Crawl-delay per origin; a host uses the largest among its origins.
-    origin_delays: HashMap<String, Duration>,
+    /// Crawl-delay per host, per origin; a host uses the largest among its origins.
+    origin_delays: HashMap<String, HashMap<String, Duration>>,
     seed_hosts: HashMap<String, String>,
     in_flight: usize,
     stats: Stats,
@@ -245,6 +247,7 @@ pub async fn crawl<F: FnMut(&Event)>(
 
     loop {
         // Start as much work as the concurrency limit and the schedule allow.
+        let busy_from = Instant::now();
         let mut wake = None;
         while crawler.in_flight < limit && !crawler.fetch_budget_spent(options.max_fetches) {
             match crawler.next_step(Instant::now())? {
@@ -256,6 +259,7 @@ pub async fn crawl<F: FnMut(&Event)>(
                     let clients = Arc::clone(&clients);
                     let tx = tx.clone();
                     let max_body = config.crawler.max_body_bytes;
+                    let token = config.crawler.product_token.clone();
                     tasks.spawn(async move {
                         let done = match job {
                             Job::Robots { origin, url, hops } => {
@@ -269,13 +273,9 @@ pub async fn crawl<F: FnMut(&Event)>(
                             }
                             Job::Page(page) => {
                                 let url = Url::parse(&page.url).expect("stored URLs are valid");
-                                let result = fetch::fetch_page(&clients, &url, max_body).await;
-                                Done::Page {
-                                    host,
-                                    page,
-                                    url,
-                                    result,
-                                }
+                                let result =
+                                    fetch::fetch_page(&clients, &url, max_body, &token).await;
+                                Done::Page { host, page, result }
                             }
                         };
                         let _ = tx.send(done);
@@ -298,10 +298,19 @@ pub async fn crawl<F: FnMut(&Event)>(
             break;
         }
 
+        crawler.stats.coordinator_busy += busy_from.elapsed();
         tokio::select! {
             Some(done) = rx.recv() => {
+                let started = Instant::now();
                 crawler.in_flight -= 1;
                 crawler.handle(done)?;
+                // Drain whatever else has finished before scheduling again, so a busy
+                // coordinator makes one scheduling pass per batch rather than per response.
+                while let Ok(done) = rx.try_recv() {
+                    crawler.in_flight -= 1;
+                    crawler.handle(done)?;
+                }
+                crawler.stats.coordinator_busy += started.elapsed();
             }
             Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Err(e) = joined {
@@ -448,13 +457,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 hops,
                 result,
             } => self.handle_robots(&host, origin, hops, result, now),
-            Done::Page {
-                host,
-                page,
-                url,
-                result,
-            } => {
-                let wait = self.handle_page(&host, page, &url, result, now)?;
+            Done::Page { host, page, result } => {
+                let wait = self.handle_page(&host, page, result, now)?;
                 self.release(&host, now, wait)
             }
         }
@@ -506,9 +510,10 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             robots::Fetched::Rules(rules) => {
                 self.store.clear_robots_failures(self.run, &origin)?;
                 let crawl_delay = rules.crawl_delay(self.config.max_crawl_delay());
+                let per_host = self.origin_delays.entry(origin_host.clone()).or_default();
                 match crawl_delay {
-                    Some(d) => self.origin_delays.insert(origin.clone(), d),
-                    None => self.origin_delays.remove(&origin),
+                    Some(d) => per_host.insert(origin.clone(), d),
+                    None => per_host.remove(&origin),
                 };
                 self.update_host_delay(&origin_host, now);
                 self.robots.insert(
@@ -564,10 +569,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
     fn update_host_delay(&mut self, host: &str, now: Instant) {
         let largest = self
             .origin_delays
-            .iter()
-            .filter(|(origin, _)| Url::parse(origin).is_ok_and(|u| urlnorm::host(&u) == host))
-            .map(|(_, d)| *d)
-            .max();
+            .get(host)
+            .and_then(|o| o.values().max().copied());
         let delay = largest
             .unwrap_or_default()
             .max(self.config.per_host_delay());
@@ -595,7 +598,6 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         &mut self,
         host: &str,
         mut page: Page,
-        url: &Url,
         result: PageResult,
         now: Instant,
     ) -> Result<Duration> {
@@ -603,27 +605,21 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         match result {
             PageResult::Body {
                 status,
-                is_html,
-                body,
+                bytes,
+                title,
+                hash,
+                links,
                 etag,
                 last_modified,
             } => {
-                self.stats.bytes += body.len() as u64;
-                let (title, fingerprint_source, links) = if is_html {
-                    let text = String::from_utf8_lossy(&body);
-                    let extract = html::extract(&text, url, &self.config.crawler.product_token);
-                    let source = extract.fingerprint_source();
-                    (extract.title, source, extract.links)
-                } else {
-                    (None, body.clone(), Vec::new())
-                };
+                self.stats.bytes += bytes as u64;
                 let outcome = Outcome {
                     status: Some(status),
                     title,
-                    hash: Some(blake3::hash(&fingerprint_source).to_hex().to_string()),
+                    hash: Some(hash),
                     etag,
                     last_modified,
-                    bytes: Some(body.len() as i64),
+                    bytes: Some(bytes as i64),
                     detail: None,
                 };
                 let discovered = self.links_to_follow(&page, links);

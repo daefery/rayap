@@ -10,7 +10,7 @@ use reqwest::{Client, Response, redirect};
 use url::Url;
 
 use crate::robots::MAX_ROBOTS_BYTES;
-use crate::{Config, Result, urlnorm};
+use crate::{Config, Result, html, urlnorm};
 
 pub struct Clients {
     http: Client,
@@ -49,10 +49,15 @@ pub enum RobotsResult {
 
 #[derive(Debug)]
 pub enum PageResult {
+    /// A 2xx response, already digested (parsing happens in the fetch task, off the
+    /// coordinator, so it scales with cores).
     Body {
         status: u16,
-        is_html: bool,
-        body: Vec<u8>,
+        bytes: usize,
+        title: Option<String>,
+        /// Fingerprint of the title and visible text (HTML) or of the raw body (other types).
+        hash: String,
+        links: Vec<Url>,
         etag: Option<String>,
         last_modified: Option<String>,
     },
@@ -75,7 +80,12 @@ pub enum PageResult {
     Network(String),
 }
 
-pub async fn fetch_page(clients: &Clients, url: &Url, max_body: usize) -> PageResult {
+pub async fn fetch_page(
+    clients: &Clients,
+    url: &Url,
+    max_body: usize,
+    product_token: &str,
+) -> PageResult {
     let response = match clients.http.get(url.clone()).send().await {
         Ok(r) => r,
         Err(e) => return PageResult::Network(describe(&e)),
@@ -89,13 +99,18 @@ pub async fn fetch_page(clients: &Clients, url: &Url, max_body: usize) -> PageRe
             let etag = header(headers, ETAG.as_str());
             let last_modified = header(headers, LAST_MODIFIED.as_str());
             match read_limited(response, max_body).await {
-                Ok(Some(body)) => PageResult::Body {
-                    status,
-                    is_html,
-                    body,
-                    etag,
-                    last_modified,
-                },
+                Ok(Some(body)) => {
+                    let (title, hash, links) = digest(&body, is_html, url, product_token);
+                    PageResult::Body {
+                        status,
+                        bytes: body.len(),
+                        title,
+                        hash,
+                        links,
+                        etag,
+                        last_modified,
+                    }
+                }
                 Ok(None) => PageResult::TooLarge {
                     status,
                     limit: max_body,
@@ -148,6 +163,25 @@ pub async fn fetch_robots(clients: &Clients, url: &str) -> RobotsResult {
         status,
         body,
         retry_after,
+    }
+}
+
+/// Title, content fingerprint and links of a fetched body.
+fn digest(
+    body: &[u8],
+    is_html: bool,
+    url: &Url,
+    product_token: &str,
+) -> (Option<String>, String, Vec<Url>) {
+    if is_html {
+        let text = String::from_utf8_lossy(body);
+        let extract = html::extract(&text, url, product_token);
+        let hash = blake3::hash(&extract.fingerprint_source())
+            .to_hex()
+            .to_string();
+        (extract.title, hash, extract.links)
+    } else {
+        (None, blake3::hash(body).to_hex().to_string(), Vec::new())
     }
 }
 

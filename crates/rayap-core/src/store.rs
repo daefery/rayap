@@ -256,10 +256,9 @@ impl Store {
 
     /// Records that a retryable attempt failed, so a restart does not reset the count.
     pub fn record_attempt(&self, url: &str, attempts: u32) -> Result<()> {
-        self.conn.execute(
-            "UPDATE pages SET attempts = ?1 WHERE url = ?2",
-            params![attempts, url],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE pages SET attempts = ?1 WHERE url = ?2")?
+            .execute(params![attempts, url])?;
         Ok(())
     }
 
@@ -290,11 +289,12 @@ impl Store {
     /// Persists that `host` must not be contacted before `until_ms` (Unix milliseconds).
     /// An existing later hold is kept.
     pub fn hold_host(&self, host: &str, until_ms: i64) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO host_holds (host, until_ms) VALUES (?1, ?2)
-             ON CONFLICT (host) DO UPDATE SET until_ms = max(until_ms, excluded.until_ms)",
-            params![host, until_ms],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO host_holds (host, until_ms) VALUES (?1, ?2)
+                 ON CONFLICT (host) DO UPDATE SET until_ms = max(until_ms, excluded.until_ms)",
+            )?
+            .execute(params![host, until_ms])?;
         Ok(())
     }
 
@@ -395,13 +395,14 @@ fn migrate(tx: &Transaction) -> Result<()> {
 }
 
 fn enqueue_in(conn: &Connection, run: i64, page: &NewPage) -> Result<bool> {
-    let changed = conn.execute(
-        "INSERT INTO pages (url, source, depth, hops, queued_run) VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT (url) DO UPDATE SET queued_run = excluded.queued_run, attempts = 0,
-             source = excluded.source, depth = excluded.depth, hops = excluded.hops
-         WHERE pages.queued_run < excluded.queued_run",
-        params![page.url, page.source, page.depth, page.hops, run],
-    )?;
+    let changed = conn
+        .prepare_cached(
+            "INSERT INTO pages (url, source, depth, hops, queued_run) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (url) DO UPDATE SET queued_run = excluded.queued_run, attempts = 0,
+                 source = excluded.source, depth = excluded.depth, hops = excluded.hops
+             WHERE pages.queued_run < excluded.queued_run",
+        )?
+        .execute(params![page.url, page.source, page.depth, page.hops, run])?;
     Ok(changed > 0)
 }
 
@@ -412,11 +413,9 @@ fn complete_in(
     kind: Option<EventKind>,
     o: Outcome,
 ) -> Result<Event> {
-    let (source, prev_hash): (String, Option<String>) = tx.query_row(
-        "SELECT source, content_hash FROM pages WHERE url = ?1",
-        [url],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (source, prev_hash): (String, Option<String>) = tx
+        .prepare_cached("SELECT source, content_hash FROM pages WHERE url = ?1")?
+        .query_row([url], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let kind = match (&o.hash, kind) {
         (Some(hash), _) => match &prev_hash {
             None => EventKind::New,
@@ -428,24 +427,24 @@ fn complete_in(
     };
     let now = unix_now();
     if o.hash.is_some() {
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE pages SET done_run = ?1, status = ?2, etag = ?3, last_modified = ?4, content_hash = ?5,
                  title = ?6, fetched_at = ?7 WHERE url = ?8",
-            params![run, o.status, o.etag, o.last_modified, o.hash, o.title, now, url],
-        )?;
+        )?
+        .execute(params![run, o.status, o.etag, o.last_modified, o.hash, o.title, now, url])?;
     } else {
         // Keep the last good fingerprint so a page that comes back is compared with it.
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE pages SET done_run = ?1, status = ?2, fetched_at = ?3 WHERE url = ?4",
-            params![run, o.status, now, url],
-        )?;
+        )?
+        .execute(params![run, o.status, now, url])?;
     }
     let prev_hash = if o.hash.is_some() { prev_hash } else { None };
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO events (run, at, source, url, kind, status, title, hash, prev_hash, bytes, detail)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![run, now, source, url, kind.as_str(), o.status, o.title, o.hash, prev_hash, o.bytes, o.detail],
-    )?;
+    )?
+    .execute(params![run, now, source, url, kind.as_str(), o.status, o.title, o.hash, prev_hash, o.bytes, o.detail])?;
     Ok(Event {
         id: tx.last_insert_rowid(),
         run,

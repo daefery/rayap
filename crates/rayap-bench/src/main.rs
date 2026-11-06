@@ -103,6 +103,16 @@ fn self_usage() -> (f64, f64) {
     )
 }
 
+/// user + system CPU seconds of another process, from /proc.
+fn process_cpu_seconds(pid: u32) -> Option<f64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let ticks: f64 = fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    Some(ticks / hz)
+}
+
 fn machine() -> serde_json::Value {
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
@@ -288,6 +298,7 @@ async fn e2e(
         }
     };
     let port = addr.port();
+    let sim_pid = sim.id();
 
     let config = Config::from_toml(&format!(
         r#"
@@ -362,11 +373,11 @@ async fn e2e(
     let (cpu1, rss) = self_usage();
     sampler.abort();
 
-    if let (Some(guard), Some(path)) = (guard, &flamegraph) {
-        if let Ok(report) = guard.report().build() {
-            let file = std::fs::File::create(path).unwrap();
-            report.flamegraph(file).unwrap();
-        }
+    if let (Some(guard), Some(path)) = (guard, &flamegraph)
+        && let Ok(report) = guard.report().build()
+    {
+        let file = std::fs::File::create(path).unwrap();
+        report.flamegraph(file).unwrap();
     }
 
     let referee: serde_json::Value = reqwest::Client::new()
@@ -378,6 +389,7 @@ async fn e2e(
         .await
         .map(|b| serde_json::from_slice(&b).unwrap_or_default())
         .unwrap_or_default();
+    let sim_cpu = sim_pid.and_then(process_cpu_seconds);
     let _ = sim.kill().await;
 
     let fetched = pages.load(Ordering::Relaxed);
@@ -438,10 +450,14 @@ async fn e2e(
             "peak_1s": peak,
         },
         "seconds_to_90pct_of_pages": t90,
+        "pages_per_second_series": per_sec,
         "politeness_bound_pages_per_second": round(f64::from(hosts) * 1000.0 / delay_ms as f64),
         "crawler_cpu_seconds": round(cpu1 - cpu0),
         "crawler_cpu_cores_avg": round((cpu1 - cpu0) / elapsed),
         "crawler_peak_rss_mib": round(rss),
+        "simulator_cpu_seconds": sim_cpu.map(round),
+        "simulator_cpu_cores_avg": sim_cpu.map(|c| round(c / elapsed)),
+        "coordinator_busy_fraction": stats.as_ref().map(|s| round(s.coordinator_busy.as_secs_f64() / elapsed)),
         "referee": referee,
         "stats": stats.map(|s| json!({ "requests": s.requests, "events": s.events, "bytes": s.bytes })),
     });
