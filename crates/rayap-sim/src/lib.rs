@@ -442,9 +442,6 @@ pub struct Referee {
     ends: AtomicU64,
 }
 
-/// Slack for clock granularity when judging gaps.
-const TOLERANCE: Duration = Duration::from_millis(1);
-
 impl Referee {
     pub fn new(hosts: u32) -> Self {
         Self {
@@ -499,7 +496,9 @@ impl Referee {
             };
             let slack = gap_min.as_millis() as i64 - required.as_millis() as i64;
             w.min_gap_slack_ms = Some(w.min_gap_slack_ms.map_or(slack, |m| m.min(slack)));
-            if gap_max + TOLERANCE < required {
+            // Proven: too soon even if the previous response ended at the earliest moment it
+            // could have. No tolerance is added; the window already covers measurement error.
+            if gap_max < required {
                 self.too_soon.fetch_add(1, Ordering::Relaxed);
                 self.note(format!(
                     "too_soon host={h} path={path} gap_ms={:.1}..{:.1} required_ms={} previous={} status={}",
@@ -514,7 +513,7 @@ impl Referee {
             }
         }
         if let Some((nb_earliest, nb_latest)) = w.not_before {
-            if now + TOLERANCE < nb_earliest {
+            if now < nb_earliest {
                 self.retry_after.fetch_add(1, Ordering::Relaxed);
                 self.note(format!("retry_after host={h} path={path}"));
             } else if now < nb_latest {
@@ -724,20 +723,37 @@ pub mod server {
         (rc == 0).then_some(n)
     }
 
-    /// Waits until every byte written to `fd` has been acknowledged, starting at `written`
-    /// (when the last byte was handed to the kernel). Returns whether delivery succeeded and
-    /// the window [earliest, latest] that contains the moment it happened (or failed): after
-    /// the last observation of unacknowledged bytes, no later than the first empty one.
+    /// Waits until every byte written has been acknowledged and returns whether delivery
+    /// succeeded, with a window [earliest, latest] that is guaranteed to contain the moment it
+    /// happened (or failed):
+    /// - `written` must be a time before the final byte was handed to the kernel, so the
+    ///   acknowledgement cannot be earlier;
+    /// - each check that still sees unacknowledged bytes raises `earliest` to the time taken
+    ///   just before that check (the acknowledgement came after the check read the queue);
+    /// - `latest` is taken just after the check that sees the queue empty.
+    ///
+    /// A pause anywhere (preemption, a slow timer) can only widen the window, never move the
+    /// true moment outside it.
     async fn delivered(fd: RawFd, written: Instant) -> (bool, Instant, Instant) {
+        bracket(written, || unacked_bytes(fd)).await
+    }
+
+    /// The bracketing logic of [`delivered`], with the queue probe passed in (for tests).
+    pub(crate) async fn bracket(
+        written: Instant,
+        mut probe: impl FnMut() -> Option<i32>,
+    ) -> (bool, Instant, Instant) {
         let deadline = written + DELIVERY_TIMEOUT;
         let mut earliest = written;
         let mut spins = 0;
         loop {
-            let observed = Instant::now();
-            match unacked_bytes(fd) {
-                Some(0) => return (true, earliest, observed),
-                Some(_) if observed < deadline => {
-                    earliest = observed;
+            let before = Instant::now();
+            let queued = probe();
+            let after = Instant::now();
+            match queued {
+                Some(0) => return (true, earliest, after),
+                Some(_) if before < deadline => {
+                    earliest = earliest.max(before);
                     // Most responses are acknowledged within microseconds on loopback: check
                     // again right away a few times before falling back to a 1 ms timer, so the
                     // window that brackets the true end stays narrow.
@@ -748,7 +764,7 @@ pub mod server {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }
-                _ => return (false, earliest, observed),
+                _ => return (false, earliest, after),
             }
         }
     }
@@ -888,11 +904,9 @@ pub mod server {
                 body,
                 head.close,
             );
-            let (ok, earliest, latest) = if write_all(&mut write_half, &bytes).await {
-                delivered(fd, Instant::now()).await
-            } else {
-                let now = Instant::now();
-                (false, now, now)
+            let (ok, earliest, latest) = match write_tracked(&write_half, &bytes).await {
+                Ok(final_write_started) => delivered(fd, final_write_started).await,
+                Err(started) => (false, started, Instant::now()),
             };
             sim.referee
                 .end(h, &head.path, &response, body.len(), earliest, latest, ok);
@@ -902,10 +916,34 @@ pub mod server {
         }
     }
 
-    async fn write_all(w: &mut tokio::net::tcp::OwnedWriteHalf, bytes: &[u8]) -> bool {
-        tokio::time::timeout(DELIVERY_TIMEOUT, w.write_all(bytes))
-            .await
-            .is_ok_and(|r| r.is_ok())
+    /// Writes all of `bytes`. On success returns the time taken just before the write call that
+    /// handed over the final byte: the last byte cannot be acknowledged before it. On failure
+    /// returns the time the writing started.
+    async fn write_tracked(
+        w: &tokio::net::tcp::OwnedWriteHalf,
+        bytes: &[u8],
+    ) -> Result<Instant, Instant> {
+        let started = Instant::now();
+        let deadline = started + DELIVERY_TIMEOUT;
+        let mut sent = 0;
+        let mut final_write = started;
+        while sent < bytes.len() {
+            match tokio::time::timeout_at(deadline.into(), w.writable()).await {
+                Ok(Ok(())) => {}
+                _ => return Err(started),
+            }
+            let before = Instant::now();
+            match w.try_write(&bytes[sent..]) {
+                Ok(0) => return Err(started),
+                Ok(n) => {
+                    sent += n;
+                    final_write = before;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => return Err(started),
+            }
+        }
+        Ok(final_write)
     }
 }
 
@@ -1268,6 +1306,39 @@ mod tests {
         assert_eq!(rep.violations.too_soon, 1, "{:?}", rep.details);
         assert_eq!(rep.uncertain.too_soon, 1);
         assert!((rep.end_window_ms_max - 5.0).abs() < 0.01);
+    }
+
+    /// The window always contains the true acknowledgement, even when the checks are delayed
+    /// (simulated preemption) right before or after reading the queue, at random.
+    #[tokio::test]
+    async fn the_delivery_window_always_contains_the_true_moment() {
+        use std::cell::Cell;
+        for seed in 0..300u64 {
+            let written = Instant::now();
+            let ack_after = Duration::from_micros(mix(seed) % 3000);
+            let true_ack = written + ack_after;
+            let calls = Cell::new(0u64);
+            let probe = || {
+                let n = calls.get();
+                calls.set(n + 1);
+                // Random stalls before and after reading the queue.
+                let r = mix(seed * 1000 + n);
+                if r.is_multiple_of(3) {
+                    std::thread::sleep(Duration::from_micros(r % 700));
+                }
+                let queued = if Instant::now() >= true_ack { 0 } else { 1 };
+                if r.is_multiple_of(5) {
+                    std::thread::sleep(Duration::from_micros((r >> 8) % 700));
+                }
+                Some(queued)
+            };
+            let (ok, earliest, latest) = server::bracket(written, probe).await;
+            assert!(ok);
+            assert!(
+                earliest <= true_ack && true_ack <= latest,
+                "seed {seed}: window excludes the ACK"
+            );
+        }
     }
 
     #[test]

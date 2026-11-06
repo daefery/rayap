@@ -19,11 +19,15 @@ the exact command for each file.
 **When a response ends:** the simulator serves HTTP/1.1 directly on TCP sockets. A
 response ends when the client's TCP stack has acknowledged its last byte (the kernel send
 queue, `TIOCOUTQ`, is empty), or when delivery fails. The referee cannot see that instant
-exactly. It records a window: from the last check that still found unacknowledged bytes to
-the first check that found none. The window was at most 5.2 ms wide in any run, and a few
+exactly. It records a window that is guaranteed to contain it. The window starts just
+before the write call that handed over the final byte, and moves up to just before each
+check that still found unacknowledged bytes. It ends just after the first check that found
+none. A property test with random stalls at both edges checks that the true moment is
+always inside. The window was at most 5.2 ms wide in any run, and a few
 microseconds on average. A request counts as a violation only if it is too soon even when
-measured from the earliest possible end. Requests that are too soon only when measured
-from a later point in the window are reported as `uncertain`.
+measured from the earliest possible end, with no extra tolerance. Requests that are too
+soon only when measured from a later point in the window are reported as `uncertain`.
+Uncertain is not a measured miss rate. It only says the referee cannot decide.
 
 **What the referee counts as a violation:**
 - a second request to a host while one is in flight;
