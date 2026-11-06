@@ -299,6 +299,18 @@ async fn e2e(
     };
     let port = addr.port();
     let sim_pid = sim.id();
+    let sim_spec: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/__sim/spec"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap_or_default())
+        .unwrap_or_default();
+    let started_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
 
     let config = Config::from_toml(&format!(
         r#"
@@ -333,27 +345,37 @@ async fn e2e(
             .unwrap()
     });
 
-    // Sample throughput every second.
+    // Every second, record cumulative pages, crawler CPU seconds and coordinator busy time,
+    // so throughput, CPU and busy fraction can be reported over the same window.
     let pages = Arc::new(AtomicU64::new(0));
-    let samples = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let busy = Arc::new(AtomicU64::new(0));
+    let samples = Arc::new(std::sync::Mutex::new(Vec::<(u64, f64, u64)>::new()));
     let sampler = {
         let pages = Arc::clone(&pages);
+        let busy = Arc::clone(&busy);
         let samples = Arc::clone(&samples);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.tick().await;
             loop {
                 tick.tick().await;
-                samples.lock().unwrap().push(pages.load(Ordering::Relaxed));
+                let cpu = self_usage().0;
+                samples.lock().unwrap().push((
+                    pages.load(Ordering::Relaxed),
+                    cpu,
+                    busy.load(Ordering::Relaxed),
+                ));
             }
         })
     };
 
     let (cpu0, _) = self_usage();
+    samples.lock().unwrap().push((0, cpu0, 0));
     let started = Instant::now();
     let mut kinds = std::collections::BTreeMap::<&'static str, u64>::new();
     let options = Options {
         resolver: Some(Arc::new(SimResolver { port })),
+        busy_micros: Some(Arc::clone(&busy)),
         ..Options::default()
     };
     let crawl_fut = crawl(&config, &mut store, options, |e| {
@@ -393,28 +415,27 @@ async fn e2e(
     let _ = sim.kill().await;
 
     let fetched = pages.load(Ordering::Relaxed);
-    let per_sec: Vec<u64> = {
-        let s = samples.lock().unwrap();
-        let mut prev = 0;
-        s.iter()
-            .map(|v| {
-                let d = v - prev;
-                prev = *v;
-                d
-            })
-            .collect()
-    };
-    // Steady state: from the first to the last second at >= 50% of the peak rate. Before it
-    // every host is fetching robots.txt and its root page; after it only hosts with long
-    // Crawl-delays or pending retries remain.
+    let samples = samples.lock().unwrap().clone();
+    let per_sec: Vec<u64> = samples.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    // Steady window: the longest run of consecutive seconds at >= 50% of the peak rate.
+    // Before it every host is fetching robots.txt and its root page; after it only hosts
+    // with long Crawl-delays or pending retries remain.
     let peak = per_sec.iter().copied().max().unwrap_or(0);
-    let first = per_sec.iter().position(|v| *v * 2 >= peak).unwrap_or(0);
-    let last = per_sec.iter().rposition(|v| *v * 2 >= peak).unwrap_or(0);
-    let steady: Vec<u64> = per_sec
-        .get(first..=last)
-        .map(<[u64]>::to_vec)
-        .unwrap_or_default();
-    let mut sorted = steady.clone();
+    let (mut first, mut len, mut run_start) = (0usize, 0usize, None::<usize>);
+    for (i, v) in per_sec.iter().chain(std::iter::once(&0)).enumerate() {
+        match (*v * 2 >= peak && peak > 0, run_start) {
+            (true, None) => run_start = Some(i),
+            (false, Some(start)) => {
+                if i - start > len {
+                    (first, len) = (start, i - start);
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    let steady = &per_sec[first..first + len];
+    let mut sorted = steady.to_vec();
     sorted.sort_unstable();
     let pct = |p: f64| {
         sorted
@@ -422,33 +443,59 @@ async fn e2e(
             .copied()
             .unwrap_or(0)
     };
-    let steady_mean = if steady.is_empty() {
-        0.0
-    } else {
-        steady.iter().sum::<u64>() as f64 / steady.len() as f64
+    let window = |a: usize, b: usize| {
+        // samples[i] is the state after i seconds; seconds a..b span samples[a]..samples[b].
+        let (s0, s1) = (samples[a], samples[b]);
+        let secs = (b - a) as f64;
+        json!({
+            "from_second": a,
+            "to_second": b,
+            "seconds": b - a,
+            "pages": s1.0 - s0.0,
+            "pages_per_second": round((s1.0 - s0.0) as f64 / secs),
+            "crawler_cpu_cores": round((s1.1 - s0.1) / secs),
+            "coordinator_busy_fraction": round((s1.2 - s0.2) as f64 / 1e6 / secs),
+        })
     };
-    let samples_total = samples.lock().unwrap().clone();
-    let t90 = samples_total
+    let steady_window = if len > 0 {
+        window(first, first + len)
+    } else {
+        json!(null)
+    };
+    let whole_window = if samples.len() > 1 {
+        window(0, samples.len() - 1)
+    } else {
+        json!(null)
+    };
+    let t90 = samples
         .iter()
-        .position(|v| *v * 10 >= fetched * 9)
-        .map_or(elapsed, |i| (i + 1) as f64);
+        .position(|v| v.0 * 10 >= fetched * 9)
+        .map_or(elapsed, |i| i as f64);
+    let sim_resolved: Vec<String> = args.clone();
 
     let report = json!({
         "mode": "e2e",
         "machine": machine(),
-        "params": { "hosts": hosts, "delay_ms": delay_ms, "concurrency": concurrency, "sim_args": sim_args, "max_depth": 2 },
+        "params": { "hosts": hosts, "delay_ms": delay_ms, "concurrency": concurrency, "sim_args": sim_args, "max_depth": 2, "max_seconds": max_seconds },
+        "provenance": {
+            "rayap_revision": option_env!("RAYAP_REVISION").unwrap_or("unknown"),
+            "simulator_command": format!("{} {}", sim_bin.display(), sim_resolved.join(" ")),
+            "simulator_spec": sim_spec,
+            "crawler_config": { "per_host_delay_ms": delay_ms, "max_concurrency": concurrency, "request_timeout_ms": 30000, "retry_backoff_ms": 2000, "max_wait_ms": 60000, "max_attempts": 3, "max_depth": 2, "sqlite": "WAL, synchronous=NORMAL" },
+            "started_unix": started_unix,
+        },
         "finished": stats.as_ref().is_some_and(|s| s.finished),
         "wall_seconds": round(elapsed),
         "pages_ok": fetched,
         "events": kinds,
         "pages_per_second": {
             "overall": round(fetched as f64 / elapsed),
-            "steady_state_mean": round(steady_mean),
-            "steady_state_p50": pct(0.5),
-            "steady_state_p10": pct(0.1),
-            "steady_window_seconds": steady.len(),
+            "steady_window": steady_window,
+            "steady_p50_1s": pct(0.5),
+            "steady_p10_1s": pct(0.1),
             "peak_1s": peak,
         },
+        "whole_run_window": whole_window,
         "seconds_to_90pct_of_pages": t90,
         "pages_per_second_series": per_sec,
         "politeness_bound_pages_per_second": round(f64::from(hosts) * 1000.0 / delay_ms as f64),

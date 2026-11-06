@@ -345,10 +345,22 @@ struct HostWatch {
     /// robots.txt has been served with 200, so the crawler knows its Crawl-delay.
     rules_served: bool,
     not_before: Option<Instant>,
-    robots_seen: bool,
+    /// What the last completed robots.txt response permits.
+    robots: RobotsSeen,
     attempts: HashMap<String, u32>,
     requests: u64,
     min_gap_slack_ms: Option<i64>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum RobotsSeen {
+    /// No robots.txt response has completed yet: no page may be requested.
+    #[default]
+    None,
+    /// The last robots.txt response was 5xx/429/network: no page may be requested (RFC 9309).
+    Unreachable,
+    /// 2xx or 4xx: pages may be requested, subject to the rules.
+    Usable,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -359,7 +371,8 @@ pub struct Violations {
     pub too_soon: u64,
     /// A request arrived before a Retry-After the host sent had expired.
     pub retry_after: u64,
-    /// A page was requested before the host's robots.txt.
+    /// A page was requested before a usable robots.txt response had been fully sent
+    /// (none yet, or the last one was a server error).
     pub before_robots: u64,
     /// A path disallowed by robots.txt was requested.
     pub disallowed: u64,
@@ -461,10 +474,9 @@ impl Referee {
             self.note(format!("retry_after host={h} path={path}"));
         }
         if path == "/robots.txt" {
-            w.robots_seen = true;
             self.robots_requests.fetch_add(1, Ordering::Relaxed);
         } else {
-            if !w.robots_seen {
+            if w.robots != RobotsSeen::Usable {
                 self.before_robots.fetch_add(1, Ordering::Relaxed);
                 self.note(format!("before_robots host={h} path={path}"));
             }
@@ -481,14 +493,22 @@ impl Referee {
         this
     }
 
-    /// Records the end of a response (after its last byte was handed to the socket).
-    pub fn end(&self, h: u32, response: &Response, bytes: usize, now: Instant) {
+    /// Records the end of a response for `path`. Call it only after the last byte of the
+    /// body has been written to the connection: the gap and Retry-After clocks start here,
+    /// so ending early would make the referee more lenient.
+    pub fn end(&self, h: u32, path: &str, response: &Response, bytes: usize, now: Instant) {
         let mut w = self.hosts[h as usize].lock().unwrap();
         w.in_flight -= 1;
         w.last_end = Some(now);
         w.last_status = response.status;
-        if w.last_path == "/robots.txt" && response.status == 200 {
-            w.rules_served = true;
+        if path == "/robots.txt" {
+            w.robots = match response.status {
+                200..=299 | 400..=428 | 430..=499 => RobotsSeen::Usable,
+                _ => RobotsSeen::Unreachable,
+            };
+            if response.status == 200 {
+                w.rules_served = true;
+            }
         }
         if response.status == 429 {
             let secs = response
@@ -543,6 +563,173 @@ impl Referee {
             min_gap_slack_ms: min_slack,
             details: self.details.lock().unwrap().clone(),
         }
+    }
+}
+
+/// The simulated web as an HTTP service: answers for every host, asks the referee before
+/// each response, and reports the end of each response only after its body is sent.
+pub mod server {
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    use axum::Router;
+    use axum::body::Body as AxumBody;
+    use axum::extract::{Request, State};
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::response::{IntoResponse, Response as AxumResponse};
+    use bytes::Bytes;
+    use futures_util::Stream;
+
+    use super::{Body, Referee, Response, WebSpec, filler, parse_host};
+
+    pub struct Sim {
+        pub spec: WebSpec,
+        pub referee: Referee,
+        filler: String,
+        /// Bytes per body chunk and the pause after each (to model slow transfers in tests).
+        chunk: usize,
+        chunk_pause: Duration,
+    }
+
+    impl Sim {
+        pub fn new(spec: WebSpec) -> Self {
+            Self::with_chunks(spec, 64 * 1024, Duration::ZERO)
+        }
+
+        pub fn with_chunks(spec: WebSpec, chunk: usize, chunk_pause: Duration) -> Self {
+            Self {
+                referee: Referee::new(spec.hosts),
+                filler: filler(spec.body_kib as usize * 1024 + 1024),
+                spec,
+                chunk: chunk.max(1),
+                chunk_pause,
+            }
+        }
+    }
+
+    pub fn router(sim: Arc<Sim>) -> Router {
+        Router::new().fallback(handle).with_state(sim)
+    }
+
+    /// Streams `bytes` and tells the referee the response ended once the last chunk has been
+    /// handed to the connection, or when the client goes away (the stream is dropped).
+    struct Tracked {
+        sim: Arc<Sim>,
+        host: u32,
+        path: String,
+        response: Response,
+        bytes: Bytes,
+        sent: usize,
+        pause: Option<Pin<Box<tokio::time::Sleep>>>,
+        ended: bool,
+    }
+
+    impl Tracked {
+        fn finish(&mut self) {
+            if !self.ended {
+                self.ended = true;
+                self.sim.referee.end(
+                    self.host,
+                    &self.path,
+                    &self.response,
+                    self.sent,
+                    Instant::now(),
+                );
+            }
+        }
+    }
+
+    impl Stream for Tracked {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(pause) = self.pause.as_mut() {
+                if pause.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.pause = None;
+            }
+            if self.sent >= self.bytes.len() {
+                // hyper polls once more after the last chunk was written: the body is out.
+                self.finish();
+                return Poll::Ready(None);
+            }
+            let end = (self.sent + self.sim.chunk).min(self.bytes.len());
+            let chunk = self.bytes.slice(self.sent..end);
+            self.sent = end;
+            if !self.sim.chunk_pause.is_zero() {
+                self.pause = Some(Box::pin(tokio::time::sleep(self.sim.chunk_pause)));
+            }
+            Poll::Ready(Some(Ok(chunk)))
+        }
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+
+    async fn handle(State(sim): State<Arc<Sim>>, request: Request) -> AxumResponse {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "/".into());
+        let Some(h) = parse_host(&host).filter(|h| *h < sim.spec.hosts) else {
+            if path == "/__sim/report" {
+                return axum::Json(sim.referee.report()).into_response();
+            }
+            if path == "/__sim/spec" {
+                return axum::Json(&sim.spec).into_response();
+            }
+            sim.referee.unknown_host();
+            return StatusCode::MISDIRECTED_REQUEST.into_response();
+        };
+
+        let attempt = sim.referee.start(&sim.spec, h, &path, Instant::now());
+        let response = sim.spec.respond(h, &path, attempt, &sim.filler);
+        tokio::time::sleep(response.latency).await;
+
+        let (content_type, bytes) = match &response.body {
+            Body::Html(s) => ("text/html; charset=utf-8", Bytes::from(s.clone())),
+            Body::Text(s) => ("text/plain", Bytes::from(s.clone())),
+            Body::Empty => ("text/plain", Bytes::new()),
+        };
+        let status =
+            StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let headers = response.headers.clone();
+        let len = bytes.len();
+        let body = Tracked {
+            sim: Arc::clone(&sim),
+            host: h,
+            path,
+            response,
+            bytes,
+            sent: 0,
+            pause: None,
+            ended: false,
+        };
+        let mut out = AxumResponse::new(AxumBody::from_stream(body));
+        *out.status_mut() = status;
+        out.headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        out.headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+        for (name, value) in headers {
+            if let Ok(v) = HeaderValue::from_str(&value) {
+                out.headers_mut().insert(name, v);
+            }
+        }
+        out
     }
 }
 
@@ -644,10 +831,10 @@ mod tests {
         let t0 = Instant::now();
         r.start(&s, 0, "/p/1", t0); // before robots
         r.start(&s, 0, "/robots.txt", t0); // concurrent
-        r.end(0, &ok, 0, t0);
-        r.end(0, &ok, 0, t0);
+        r.end(0, "/p/1", &ok, 0, t0);
+        r.end(0, "/robots.txt", &ok, 0, t0);
         r.start(&s, 0, "/p/2", t0 + Duration::from_millis(50)); // too soon
-        r.end(0, &ok, 0, t0 + Duration::from_millis(50));
+        r.end(0, "/p/2", &ok, 0, t0 + Duration::from_millis(50));
         r.start(&s, 0, "/p/3", t0 + Duration::from_millis(200)); // fine
         let v = r.report().violations;
         assert_eq!(
@@ -679,13 +866,100 @@ mod tests {
         };
         let t0 = Instant::now();
         r.start(&s, h, "/robots.txt", t0);
-        r.end(h, &failed, 0, t0);
+        r.end(h, "/robots.txt", &failed, 0, t0);
         // Only the base delay applies: the crawler has not seen the Crawl-delay yet.
         r.start(&s, h, "/robots.txt", t0 + Duration::from_millis(150));
-        r.end(h, &ok, 0, t0 + Duration::from_millis(150));
+        r.end(h, "/robots.txt", &ok, 0, t0 + Duration::from_millis(150));
         assert_eq!(r.report().violations.too_soon, 0);
         // Now the Crawl-delay applies.
         r.start(&s, h, "/", t0 + Duration::from_millis(300));
         assert_eq!(r.report().violations.too_soon, 1);
+    }
+
+    /// Negative control: a client that ignores the delay while bodies are still streaming must
+    /// be caught. With the end recorded before the body was sent, this request would pass.
+    #[tokio::test]
+    async fn referee_measures_gaps_from_the_end_of_the_body() {
+        use std::sync::Arc;
+        let s = WebSpec {
+            hosts: 1,
+            pages: 1,
+            body_kib: 64,
+            latency_median_ms: 1,
+            latency_sigma: 0.0,
+            slow_hosts_pct: 0.0,
+            error_pct: 0.0,
+            throttle_pct: 0.0,
+            gone_pct: 0.0,
+            redirect_pct: 0.0,
+            robots_missing_pct: 100.0,
+            robots_flaky_pct: 0.0,
+            delay_ms: 300,
+            ..spec()
+        };
+        // 64 KiB in 8 KiB chunks, 50 ms apart: the body takes about 400 ms to send.
+        let sim = Arc::new(server::Sim::with_chunks(
+            s,
+            8 * 1024,
+            Duration::from_millis(50),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = server::router(Arc::clone(&sim));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let get = |path: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: h00000.sim\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+        };
+        get("/robots.txt").await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        get("/").await; // body streams for ~400 ms
+        // Polite: wait the full delay after the body finished.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        get("/p/0").await;
+        assert_eq!(
+            sim.referee.report().violations.too_soon,
+            0,
+            "{:?}",
+            sim.referee.report().details
+        );
+
+        // Impolite: request again 150 ms after a slow body ended (300 ms required).
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        get("/").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        get("/p/0").await;
+        assert_eq!(
+            sim.referee.report().violations.too_soon,
+            1,
+            "{:?}",
+            sim.referee.report().details
+        );
+    }
+
+    #[test]
+    fn a_page_after_a_failed_robots_txt_is_a_violation() {
+        let s = WebSpec {
+            delay_ms: 100,
+            ..spec()
+        };
+        let r = Referee::new(1);
+        let failed = Response {
+            status: 503,
+            headers: vec![],
+            body: Body::Empty,
+            latency: Duration::ZERO,
+        };
+        let t0 = Instant::now();
+        r.start(&s, 0, "/robots.txt", t0);
+        r.end(0, "/robots.txt", &failed, 0, t0);
+        r.start(&s, 0, "/", t0 + Duration::from_millis(500));
+        assert_eq!(r.report().violations.before_robots, 1);
     }
 }

@@ -46,6 +46,8 @@ pub struct Options {
     pub max_fetches: Option<u64>,
     /// Replaces system DNS (benchmarks point simulated host names at a local server).
     pub resolver: Option<Arc<dyn reqwest::dns::Resolve>>,
+    /// Running total of coordinator busy time in microseconds, for live sampling.
+    pub busy_micros: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl std::fmt::Debug for Options {
@@ -53,6 +55,7 @@ impl std::fmt::Debug for Options {
         f.debug_struct("Options")
             .field("max_fetches", &self.max_fetches)
             .field("resolver", &self.resolver.as_ref().map(|_| "custom"))
+            .field("busy_micros", &self.busy_micros.is_some())
             .finish()
     }
 }
@@ -298,7 +301,14 @@ pub async fn crawl<F: FnMut(&Event)>(
             break;
         }
 
-        crawler.stats.coordinator_busy += busy_from.elapsed();
+        let busy = busy_from.elapsed();
+        crawler.stats.coordinator_busy += busy;
+        if let Some(counter) = &options.busy_micros {
+            counter.fetch_add(
+                busy.as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         tokio::select! {
             Some(done) = rx.recv() => {
                 let started = Instant::now();
@@ -310,7 +320,11 @@ pub async fn crawl<F: FnMut(&Event)>(
                     crawler.in_flight -= 1;
                     crawler.handle(done)?;
                 }
-                crawler.stats.coordinator_busy += started.elapsed();
+                let busy = started.elapsed();
+                crawler.stats.coordinator_busy += busy;
+                if let Some(counter) = &options.busy_micros {
+                    counter.fetch_add(busy.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Err(e) = joined {

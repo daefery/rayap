@@ -1604,6 +1604,7 @@ dependencies = [
  "libc",
  "pprof",
  "rayap-core",
+ "rayap-sim",
  "reqwest",
  "serde_json",
  "tokio",
