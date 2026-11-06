@@ -2,8 +2,14 @@
 //!
 //! One coordinator owns the frontier, the robots.txt cache and the store; fetches run as
 //! tasks and report back over a channel. Because only the coordinator touches state, the
-//! scheduling rules (one request in flight per host, delay between requests, robots.txt
-//! before pages) hold without locks.
+//! scheduling rules hold without locks:
+//!
+//! - every request, including robots.txt and each redirect hop of a robots.txt fetch, is
+//!   handed out by the frontier, so a host never has two requests in flight and always gets
+//!   its delay between requests;
+//! - no page is requested before its origin's robots.txt is known;
+//! - a host told to wait (Retry-After, backoff) is held for the full time, and the hold is
+//!   stored so a restart does not contact it early.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,22 +19,22 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep_until};
 use url::Url;
 
-use crate::fetch::{self, Clients, PageResult};
-use crate::frontier::{Frontier, Next, Task};
+use crate::fetch::{self, Clients, PageResult, RobotsResult};
+use crate::frontier::{Frontier, Next};
 use crate::robots::{self, Rules};
-use crate::store::{Event, EventKind, Outcome, Store};
+use crate::store::{Event, EventKind, NewPage, Outcome, Store, unix_now_ms};
 use crate::{Config, Error, Result, html, urlnorm};
 
-/// Wait after an unreachable robots.txt before asking again (the host is blocked meanwhile).
-const ROBOTS_RETRY: Duration = Duration::from_secs(5 * 60);
 /// Delay used for 429/503 without a usable Retry-After.
 const SLOW_DOWN_DEFAULT: Duration = Duration::from_secs(60);
-/// Longest Retry-After rayap will wait within a run; beyond that the page is reported as an error.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+/// RFC 9309 §2.3.1.2: follow at least five consecutive redirects for robots.txt.
+const MAX_ROBOTS_HOPS: u32 = 5;
+/// Redirects followed from one source URL before the chain is reported as an error.
+const MAX_PAGE_HOPS: u32 = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
-    /// Stop after this many page fetches (robots.txt requests not counted). Useful for tests
+    /// Stop after this many page requests (robots.txt requests not counted). Useful for tests
     /// and trial runs; an interrupted run resumes next time.
     pub max_fetches: Option<u64>,
 }
@@ -45,22 +51,60 @@ pub struct Stats {
     pub finished: bool,
 }
 
+/// A page waiting to be fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Page {
+    url: String,
+    source: String,
+    depth: u32,
+    hops: u32,
+    attempts: u32,
+}
+
+/// One unit of work in the frontier: a request to the queue's host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Work {
+    Page(Page),
+    /// Fetch `url` on behalf of `origin`'s robots.txt (the first request or a redirect hop).
+    Robots {
+        origin: String,
+        url: String,
+        hops: u32,
+    },
+}
+
 enum RobotsState {
     Fetching,
-    Known { rules: Rules, fetched: Instant },
-    Unreachable { until: Instant, reason: String },
+    Known {
+        rules: Rules,
+        fetched: Instant,
+    },
+    /// Pages wait while robots.txt is retried with backoff; after `max_attempts` failures in
+    /// this run they are reported as blocked.
+    Unreachable {
+        until: Instant,
+        reason: String,
+        failures: u32,
+    },
 }
 
 enum Job {
-    Robots { host: String, origin: String },
-    Page { host: String, task: Task },
+    Robots {
+        origin: String,
+        url: String,
+        hops: u32,
+    },
+    Page(Page),
 }
 
 enum Step {
-    Start(Job),
+    Start {
+        host: String,
+        job: Job,
+    },
     /// Stop starting work for now; the next host becomes eligible at this time, if any.
     Wait(Option<Instant>),
-    /// A task was settled without a request (blocked by robots.txt); ask again.
+    /// An item was settled without a request; ask again.
     Again,
 }
 
@@ -68,11 +112,12 @@ enum Done {
     Robots {
         host: String,
         origin: String,
-        fetched: robots::Fetched,
+        hops: u32,
+        result: RobotsResult,
     },
     Page {
         host: String,
-        task: Task,
+        page: Page,
         url: Url,
         result: PageResult,
     },
@@ -82,10 +127,15 @@ struct Crawler<'a, F: FnMut(&Event)> {
     config: &'a Config,
     store: &'a mut Store,
     run: i64,
-    frontier: Frontier,
+    frontier: Frontier<Work>,
     robots: HashMap<String, RobotsState>,
-    /// Tasks parked until their origin's robots.txt is known.
-    waiting_for_robots: HashMap<String, Vec<(String, Task)>>,
+    /// Pages parked until their origin's robots.txt is known.
+    waiting_for_robots: HashMap<String, Vec<Page>>,
+    /// robots.txt failures so far in this run, for origins being fetched.
+    robots_failures: HashMap<String, u32>,
+    /// Crawl-delay per origin; a host uses the largest among its origins.
+    origin_delays: HashMap<String, Duration>,
+    seed_hosts: HashMap<String, String>,
     in_flight: usize,
     stats: Stats,
     on_event: F,
@@ -103,6 +153,20 @@ pub async fn crawl<F: FnMut(&Event)>(
     let sources: Vec<&str> = config.sources.iter().map(|s| s.name.as_str()).collect();
     let (run, resumed) = store.begin_run(&sources)?;
     let now = Instant::now();
+    let mut seed_hosts = HashMap::new();
+    for source in &config.sources {
+        let url = urlnorm::normalize(&source.url, None).expect("validated in Config");
+        seed_hosts.insert(source.name.clone(), urlnorm::host(&url));
+        store.enqueue(
+            run,
+            &NewPage {
+                url: url.to_string(),
+                source: source.name.clone(),
+                depth: 0,
+                hops: 0,
+            },
+        )?;
+    }
     let mut crawler = Crawler {
         config,
         store,
@@ -110,6 +174,9 @@ pub async fn crawl<F: FnMut(&Event)>(
         frontier: Frontier::new(config.per_host_delay()),
         robots: HashMap::new(),
         waiting_for_robots: HashMap::new(),
+        robots_failures: HashMap::new(),
+        origin_delays: HashMap::new(),
+        seed_hosts,
         in_flight: 0,
         stats: Stats {
             run,
@@ -119,24 +186,28 @@ pub async fn crawl<F: FnMut(&Event)>(
         on_event,
     };
 
-    for source in &config.sources {
-        let url = urlnorm::normalize(&source.url, None).expect("validated in Config");
-        crawler.store.enqueue(run, url.as_str(), &source.name, 0)?;
+    let now_ms = unix_now_ms();
+    for (host, until_ms) in crawler.store.active_holds()? {
+        let wait = Duration::from_millis(u64::try_from(until_ms - now_ms).unwrap_or(0));
+        crawler.frontier.hold(&host, now + wait, now);
     }
-    for page in crawler.store.pending(run)? {
-        if !config.sources.iter().any(|s| s.name == page.source) {
+    for p in crawler.store.pending(run)? {
+        if !config.sources.iter().any(|s| s.name == p.source) {
             continue;
         }
-        let Ok(url) = Url::parse(&page.url) else {
+        let Ok(url) = Url::parse(&p.url) else {
             continue;
         };
-        let task = Task {
-            url: page.url,
-            source: page.source,
-            depth: page.depth,
-            attempts: page.attempts,
+        let page = Page {
+            url: p.url,
+            source: p.source,
+            depth: p.depth,
+            hops: p.hops,
+            attempts: p.attempts,
         };
-        crawler.frontier.push(&urlnorm::host(&url), task, now);
+        crawler
+            .frontier
+            .push(&urlnorm::host(&url), Work::Page(page), now);
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Done>();
@@ -147,32 +218,32 @@ pub async fn crawl<F: FnMut(&Event)>(
         // Start as much work as the concurrency limit and the schedule allow.
         let mut wake = None;
         while crawler.in_flight < limit && !crawler.fetch_budget_spent(options.max_fetches) {
-            match crawler.next_job(Instant::now())? {
-                Step::Start(job) => {
+            match crawler.next_step(Instant::now())? {
+                Step::Start { host, job } => {
                     crawler.in_flight += 1;
+                    if matches!(job, Job::Page(_)) {
+                        crawler.stats.requests += 1;
+                    }
                     let clients = Arc::clone(&clients);
                     let tx = tx.clone();
                     let max_body = config.crawler.max_body_bytes;
-                    let token = config.crawler.product_token.clone();
-                    if matches!(job, Job::Page { .. }) {
-                        crawler.stats.requests += 1;
-                    }
                     tasks.spawn(async move {
                         let done = match job {
-                            Job::Robots { host, origin } => {
-                                let fetched = fetch::fetch_robots(&clients, &origin, &token).await;
+                            Job::Robots { origin, url, hops } => {
+                                let result = fetch::fetch_robots(&clients, &url).await;
                                 Done::Robots {
                                     host,
                                     origin,
-                                    fetched,
+                                    hops,
+                                    result,
                                 }
                             }
-                            Job::Page { host, task } => {
-                                let url = Url::parse(&task.url).expect("stored URLs are valid");
+                            Job::Page(page) => {
+                                let url = Url::parse(&page.url).expect("stored URLs are valid");
                                 let result = fetch::fetch_page(&clients, &url, max_body).await;
                                 Done::Page {
                                     host,
-                                    task,
+                                    page,
                                     url,
                                     result,
                                 }
@@ -189,8 +260,10 @@ pub async fn crawl<F: FnMut(&Event)>(
             }
         }
 
-        if crawler.in_flight == 0 && wake.is_none() {
-            break; // nothing in flight and nothing scheduled: the run is complete or the budget is spent
+        if crawler.in_flight == 0
+            && (wake.is_none() || crawler.fetch_budget_spent(options.max_fetches))
+        {
+            break;
         }
 
         tokio::select! {
@@ -207,7 +280,8 @@ pub async fn crawl<F: FnMut(&Event)>(
         }
     }
 
-    let complete = crawler.frontier.pending() == 0 && crawler.waiting_for_robots.is_empty();
+    let complete =
+        crawler.frontier.pending() == 0 && crawler.waiting_for_robots.values().all(Vec::is_empty);
     if complete {
         crawler.store.finish_run(run)?;
     }
@@ -220,59 +294,110 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         max.is_some_and(|m| self.stats.requests >= m)
     }
 
-    fn next_job(&mut self, now: Instant) -> Result<Step> {
-        let (host, task) = match self.frontier.next(now) {
-            Next::Ready { host, task } => (host, task),
+    fn next_step(&mut self, now: Instant) -> Result<Step> {
+        let (host, work) = match self.frontier.next(now) {
+            Next::Ready { host, item } => (host, item),
             Next::WaitUntil(at) => return Ok(Step::Wait(Some(at))),
             Next::Idle => return Ok(Step::Wait(None)),
         };
-        let url = Url::parse(&task.url).expect("stored URLs are valid");
+        let page = match work {
+            Work::Robots { origin, url, hops } => {
+                return Ok(Step::Start {
+                    host,
+                    job: Job::Robots { origin, url, hops },
+                });
+            }
+            Work::Page(page) => page,
+        };
+        let url = Url::parse(&page.url).expect("stored URLs are valid");
         let origin = urlnorm::origin(&url);
 
-        let refresh = match self.robots.get(&origin) {
+        let state = self.robots.get(&origin);
+        let max_attempts = self.config.crawler.max_attempts;
+        let refresh = match state {
             None => true,
             Some(RobotsState::Known { fetched, .. }) => {
                 now.duration_since(*fetched) >= robots::MAX_CACHE_AGE
             }
-            Some(RobotsState::Unreachable { until, .. }) => now >= *until,
+            Some(RobotsState::Unreachable {
+                until, failures, ..
+            }) => now >= *until && *failures < max_attempts,
             Some(RobotsState::Fetching) => false,
         };
         if refresh {
+            let failures = match state {
+                Some(RobotsState::Unreachable { failures, .. }) => *failures,
+                _ => 0,
+            };
+            self.robots_failures.insert(origin.clone(), failures);
             self.robots.insert(origin.clone(), RobotsState::Fetching);
             self.waiting_for_robots
                 .entry(origin.clone())
                 .or_default()
-                .push((host.clone(), task));
-            // The host stays busy while its robots.txt is fetched, so the request counts
-            // against the same politeness budget as a page.
-            return Ok(Step::Start(Job::Robots { host, origin }));
+                .push(page);
+            let robots_url = format!("{origin}/robots.txt");
+            return Ok(Step::Start {
+                host,
+                job: Job::Robots {
+                    origin,
+                    url: robots_url,
+                    hops: 0,
+                },
+            });
         }
 
-        let reason = match self.robots.get(&origin) {
-            Some(RobotsState::Known { rules, .. }) if rules.allowed(url.as_str()) => {
-                return Ok(Step::Start(Job::Page { host, task }));
+        match state {
+            Some(RobotsState::Known { rules, .. })
+                if rules.allowed(&url[url::Position::BeforePath..]) =>
+            {
+                Ok(Step::Start {
+                    host,
+                    job: Job::Page(page),
+                })
             }
-            Some(RobotsState::Known { rules, .. }) => rules.block_reason(),
-            Some(RobotsState::Unreachable { reason, .. }) => {
-                format!("robots.txt unreachable ({reason})")
+            Some(RobotsState::Known { rules, .. }) => {
+                let reason = rules.block_reason();
+                // No request was made, so the host may be used again immediately.
+                self.frontier.release(&host, now, Duration::ZERO);
+                self.commit(
+                    &page.url,
+                    Some(EventKind::Blocked),
+                    Outcome {
+                        detail: Some(reason),
+                        ..Outcome::default()
+                    },
+                    Vec::new(),
+                )?;
+                Ok(Step::Again)
             }
-            // An origin belongs to exactly one host, and a host fetching its robots.txt is
-            // busy, so its tasks cannot be handed out meanwhile.
-            Some(RobotsState::Fetching) | None => {
-                unreachable!("robots.txt state is settled before tasks run")
+            Some(RobotsState::Unreachable {
+                reason, failures, ..
+            }) if *failures >= self.config.crawler.max_attempts => {
+                let detail = format!("robots.txt unreachable after {failures} attempts ({reason})");
+                self.frontier.release(&host, now, Duration::ZERO);
+                self.commit(
+                    &page.url,
+                    Some(EventKind::Blocked),
+                    Outcome {
+                        detail: Some(detail),
+                        ..Outcome::default()
+                    },
+                    Vec::new(),
+                )?;
+                Ok(Step::Again)
             }
-        };
-        // No request was made, so the host may be used again immediately.
-        self.frontier.release(&host, now, Duration::ZERO);
-        self.commit(
-            &task.url,
-            Some(EventKind::Blocked),
-            Outcome {
-                detail: Some(reason),
-                ..Outcome::default()
-            },
-        )?;
-        Ok(Step::Again)
+            Some(RobotsState::Unreachable { .. } | RobotsState::Fetching) => {
+                // An unreachable robots.txt is never treated as permission: the page waits
+                // until robots.txt is retried.
+                self.waiting_for_robots
+                    .entry(origin)
+                    .or_default()
+                    .push(page);
+                self.frontier.release(&host, now, Duration::ZERO);
+                Ok(Step::Again)
+            }
+            None => unreachable!("handled by refresh"),
+        }
     }
 
     fn handle(&mut self, done: Done) -> Result<()> {
@@ -281,59 +406,139 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             Done::Robots {
                 host,
                 origin,
-                fetched,
-            } => {
-                let parked = self.waiting_for_robots.remove(&origin).unwrap_or_default();
-                match fetched {
-                    robots::Fetched::Rules(rules) => {
-                        if let Some(delay) = rules.crawl_delay() {
-                            let delay = delay
-                                .min(self.config.max_crawl_delay())
-                                .max(self.config.per_host_delay());
-                            self.frontier.set_delay(&host, delay, now);
-                        }
-                        self.robots.insert(
-                            origin,
-                            RobotsState::Known {
-                                rules,
-                                fetched: now,
-                            },
-                        );
-                    }
-                    robots::Fetched::Unreachable { reason } => {
-                        self.robots.insert(
-                            origin,
-                            RobotsState::Unreachable {
-                                until: now + ROBOTS_RETRY,
-                                reason,
-                            },
-                        );
-                    }
-                }
-                for (task_host, task) in parked {
-                    self.frontier.push_front(&task_host, task, now);
-                }
-                let delay = self.frontier.delay(&host);
-                self.frontier.release(&host, now, delay);
-            }
+                hops,
+                result,
+            } => self.handle_robots(&host, origin, hops, result, now),
             Done::Page {
                 host,
-                task,
+                page,
                 url,
                 result,
             } => {
-                let wait = self.handle_page(&host, task, &url, result, now)?;
+                let wait = self.handle_page(&host, page, &url, result, now)?;
                 self.frontier.release(&host, now, wait);
+                Ok(())
             }
         }
+    }
+
+    fn handle_robots(
+        &mut self,
+        host: &str,
+        origin: String,
+        hops: u32,
+        result: RobotsResult,
+        now: Instant,
+    ) -> Result<()> {
+        let delay = self.frontier.delay(host);
+        let fetched = match result {
+            RobotsResult::Redirect(Some(target)) if hops < MAX_ROBOTS_HOPS => {
+                // The next hop is queued on the target's host, so it waits its turn there.
+                let work = Work::Robots {
+                    origin,
+                    url: target.to_string(),
+                    hops: hops + 1,
+                };
+                self.frontier.push_front(&urlnorm::host(&target), work, now);
+                self.frontier.release(host, now, delay);
+                return Ok(());
+            }
+            RobotsResult::Redirect(_) => {
+                // Too many redirects (or no Location): treat as unavailable, RFC 9309 §2.3.1.2.
+                robots::Fetched::Rules(Rules::AllowAll)
+            }
+            RobotsResult::Response {
+                status,
+                body,
+                retry_after,
+            } => {
+                if let Some(wait) = retry_after {
+                    self.hold(host, now + wait, now)?;
+                }
+                robots::interpret(status, &body, &self.config.crawler.product_token)
+            }
+            RobotsResult::Network(reason) => robots::Fetched::Unreachable {
+                reason: format!("robots.txt: {reason}"),
+            },
+        };
+
+        let origin_host = Url::parse(&origin)
+            .map(|u| urlnorm::host(&u))
+            .unwrap_or_else(|_| host.to_string());
+        match fetched {
+            robots::Fetched::Rules(rules) => {
+                let crawl_delay = rules.crawl_delay(self.config.max_crawl_delay());
+                match crawl_delay {
+                    Some(d) => self.origin_delays.insert(origin.clone(), d),
+                    None => self.origin_delays.remove(&origin),
+                };
+                self.update_host_delay(&origin_host, now);
+                self.robots.insert(
+                    origin.clone(),
+                    RobotsState::Known {
+                        rules,
+                        fetched: now,
+                    },
+                );
+            }
+            robots::Fetched::Unreachable { reason } => {
+                let failures = self.robots_failures.remove(&origin).unwrap_or(0) + 1;
+                let wait = self
+                    .frontier
+                    .delay(&origin_host)
+                    .max(self.config.retry_backoff() * failures);
+                self.hold(&origin_host, now + wait, now)?;
+                self.robots.insert(
+                    origin.clone(),
+                    RobotsState::Unreachable {
+                        until: now + wait,
+                        reason,
+                        failures,
+                    },
+                );
+            }
+        }
+        for page in self
+            .waiting_for_robots
+            .remove(&origin)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+        {
+            self.frontier
+                .push_front(&origin_host, Work::Page(page), now);
+        }
+        let delay = self.frontier.delay(host);
+        self.frontier.release(host, now, delay);
         Ok(())
+    }
+
+    /// A host's delay is the configured delay or the largest Crawl-delay of its origins.
+    fn update_host_delay(&mut self, host: &str, now: Instant) {
+        let largest = self
+            .origin_delays
+            .iter()
+            .filter(|(origin, _)| Url::parse(origin).is_ok_and(|u| urlnorm::host(&u) == host))
+            .map(|(_, d)| *d)
+            .max();
+        let delay = largest
+            .unwrap_or_default()
+            .max(self.config.per_host_delay());
+        self.frontier.set_delay(host, delay, now);
+    }
+
+    fn hold(&mut self, host: &str, until: Instant, now: Instant) -> Result<()> {
+        self.frontier.hold(host, until, now);
+        let ms =
+            i64::try_from(until.saturating_duration_since(now).as_millis()).unwrap_or(i64::MAX / 2);
+        self.store.hold_host(host, unix_now_ms().saturating_add(ms))
     }
 
     /// Records the page outcome and returns how long the host must rest before its next request.
     fn handle_page(
         &mut self,
         host: &str,
-        mut task: Task,
+        mut page: Page,
         url: &Url,
         result: PageResult,
         now: Instant,
@@ -365,33 +570,39 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                     bytes: Some(body.len() as i64),
                     detail: None,
                 };
-                self.commit(&task.url, None, outcome)?;
-                self.follow_links(&task, url, links, now)?;
+                let discovered = self.links_to_follow(&page, links);
+                self.commit(&page.url, None, outcome, discovered)?;
                 Ok(delay)
             }
             PageResult::Redirect { status, location } => {
-                let detail = location
-                    .as_ref()
-                    .map(|l| l.to_string())
-                    .unwrap_or_else(|| "missing Location".into());
-                let kind = if location.is_some() {
-                    EventKind::Redirect
-                } else {
-                    EventKind::Error
+                let (kind, detail, discovered) = match location {
+                    Some(target) if page.hops < MAX_PAGE_HOPS => {
+                        // The target is crawled as its own page: robots.txt and politeness for its host.
+                        let next = NewPage {
+                            url: target.to_string(),
+                            source: page.source.clone(),
+                            depth: page.depth,
+                            hops: page.hops + 1,
+                        };
+                        (EventKind::Redirect, target.to_string(), vec![next])
+                    }
+                    Some(target) => (
+                        EventKind::Error,
+                        format!("more than {MAX_PAGE_HOPS} redirects (next: {target})"),
+                        Vec::new(),
+                    ),
+                    None => (
+                        EventKind::Error,
+                        "redirect without a usable Location".into(),
+                        Vec::new(),
+                    ),
                 };
-                self.commit(
-                    &task.url,
-                    Some(kind),
-                    Outcome {
-                        status: Some(status),
-                        detail: Some(detail),
-                        ..Outcome::default()
-                    },
-                )?;
-                if let Some(target) = location {
-                    // The target is crawled as its own page and passes robots.txt for its own origin.
-                    self.enqueue(&target, &task.source, task.depth, now)?;
-                }
+                let outcome = Outcome {
+                    status: Some(status),
+                    detail: Some(detail),
+                    ..Outcome::default()
+                };
+                self.commit(&page.url, Some(kind), outcome, discovered)?;
                 Ok(delay)
             }
             PageResult::SlowDown {
@@ -399,136 +610,159 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 retry_after,
             } => {
                 let wait = retry_after.unwrap_or(SLOW_DOWN_DEFAULT).max(delay);
-                if wait > MAX_RETRY_AFTER || task.attempts + 1 >= self.config.crawler.max_attempts {
+                // The host is held for the full time the server asked for, whatever happens to this page.
+                self.hold(host, now + wait, now)?;
+                if page.attempts + 1 >= self.config.crawler.max_attempts {
                     let detail = format!(
                         "HTTP {status}, gave up after {} attempts",
-                        task.attempts + 1
+                        page.attempts + 1
                     );
                     self.commit(
-                        &task.url,
+                        &page.url,
                         Some(EventKind::Error),
                         Outcome {
                             status: Some(status),
                             detail: Some(detail),
                             ..Outcome::default()
                         },
+                        Vec::new(),
                     )?;
-                    return Ok(wait.min(MAX_RETRY_AFTER));
+                } else {
+                    self.retry(host, &mut page, now)?;
                 }
-                self.retry(host, &mut task, now)?;
                 Ok(wait)
             }
             PageResult::Status(status @ (404 | 410)) => {
                 self.commit(
-                    &task.url,
+                    &page.url,
                     Some(EventKind::Gone),
                     Outcome {
                         status: Some(status),
                         ..Outcome::default()
                     },
+                    Vec::new(),
                 )?;
                 Ok(delay)
             }
             PageResult::Status(status) if status >= 500 => {
-                self.retry_or_fail(host, task, Some(status), format!("HTTP {status}"), now)
+                self.retry_or_fail(host, page, Some(status), format!("HTTP {status}"), now)
             }
             PageResult::Status(status) => {
                 self.commit(
-                    &task.url,
+                    &page.url,
                     Some(EventKind::Error),
                     Outcome {
                         status: Some(status),
                         detail: Some(format!("HTTP {status}")),
                         ..Outcome::default()
                     },
+                    Vec::new(),
                 )?;
                 Ok(delay)
             }
             PageResult::TooLarge { status, limit } => {
                 let detail = format!("body larger than {limit} bytes");
                 self.commit(
-                    &task.url,
+                    &page.url,
                     Some(EventKind::Error),
                     Outcome {
                         status: Some(status),
                         detail: Some(detail),
                         ..Outcome::default()
                     },
+                    Vec::new(),
                 )?;
                 Ok(delay)
             }
-            PageResult::Network(reason) => self.retry_or_fail(host, task, None, reason, now),
+            PageResult::Network(reason) => self.retry_or_fail(host, page, None, reason, now),
         }
     }
 
     fn retry_or_fail(
         &mut self,
         host: &str,
-        mut task: Task,
+        mut page: Page,
         status: Option<u16>,
         reason: String,
         now: Instant,
     ) -> Result<Duration> {
         let delay = self.frontier.delay(host);
-        if task.attempts + 1 >= self.config.crawler.max_attempts {
-            let detail = format!("{reason}, gave up after {} attempts", task.attempts + 1);
+        if page.attempts + 1 >= self.config.crawler.max_attempts {
+            let detail = format!("{reason}, gave up after {} attempts", page.attempts + 1);
             self.commit(
-                &task.url,
+                &page.url,
                 Some(EventKind::Error),
                 Outcome {
                     status,
                     detail: Some(detail),
                     ..Outcome::default()
                 },
+                Vec::new(),
             )?;
             return Ok(delay);
         }
-        self.retry(host, &mut task, now)?;
-        Ok(delay.max(self.config.retry_backoff() * task.attempts))
+        self.retry(host, &mut page, now)?;
+        let wait = delay.max(self.config.retry_backoff() * page.attempts);
+        self.hold(host, now + wait, now)?;
+        Ok(wait)
     }
 
-    fn retry(&mut self, host: &str, task: &mut Task, now: Instant) -> Result<()> {
-        task.attempts += 1;
-        self.store.record_attempt(&task.url, task.attempts)?;
-        self.frontier.push_front(host, task.clone(), now);
+    fn retry(&mut self, host: &str, page: &mut Page, now: Instant) -> Result<()> {
+        page.attempts += 1;
+        self.store.record_attempt(&page.url, page.attempts)?;
+        self.frontier
+            .push_front(host, Work::Page(page.clone()), now);
         Ok(())
     }
 
-    fn follow_links(
-        &mut self,
-        parent: &Task,
-        parent_url: &Url,
-        links: Vec<Url>,
-        now: Instant,
-    ) -> Result<()> {
+    /// Links on the source's own host, while the source's depth allows.
+    fn links_to_follow(&self, parent: &Page, links: Vec<Url>) -> Vec<NewPage> {
         let Some(source) = self.config.sources.iter().find(|s| s.name == parent.source) else {
-            return Ok(());
+            return Vec::new();
         };
         if parent.depth >= source.max_depth {
-            return Ok(());
+            return Vec::new();
         }
-        let parent_host = parent_url.host_str();
-        for link in links.into_iter().filter(|l| l.host_str() == parent_host) {
-            self.enqueue(&link, &parent.source, parent.depth + 1, now)?;
-        }
-        Ok(())
+        let seed_host = self.seed_hosts.get(&parent.source).map(String::as_str);
+        links
+            .into_iter()
+            .filter(|l| l.host_str() == seed_host)
+            .map(|l| NewPage {
+                url: l.to_string(),
+                source: parent.source.clone(),
+                depth: parent.depth + 1,
+                hops: 0,
+            })
+            .collect()
     }
 
-    fn enqueue(&mut self, url: &Url, source: &str, depth: u32, now: Instant) -> Result<()> {
-        if self.store.enqueue(self.run, url.as_str(), source, depth)? {
-            let task = Task {
-                url: url.to_string(),
-                source: source.to_string(),
-                depth,
+    /// Commits the outcome, its event and the pages it led to atomically, then queues the
+    /// pages that are new to this run and reports the event.
+    fn commit(
+        &mut self,
+        url: &str,
+        kind: Option<EventKind>,
+        outcome: Outcome,
+        discovered: Vec<NewPage>,
+    ) -> Result<()> {
+        let (event, added) = self
+            .store
+            .complete(self.run, url, kind, outcome, discovered)?;
+        let now = Instant::now();
+        for p in added {
+            let Ok(parsed) = Url::parse(&p.url) else {
+                continue;
+            };
+            let page = Page {
+                url: p.url,
+                source: p.source,
+                depth: p.depth,
+                hops: p.hops,
                 attempts: 0,
             };
-            self.frontier.push(&urlnorm::host(url), task, now);
+            self.frontier
+                .push(&urlnorm::host(&parsed), Work::Page(page), now);
         }
-        Ok(())
-    }
-
-    fn commit(&mut self, url: &str, kind: Option<EventKind>, outcome: Outcome) -> Result<()> {
-        let event = self.store.complete(self.run, url, kind, outcome)?;
         self.stats.events += 1;
         if matches!(event.kind, EventKind::Changed) {
             self.stats.changed += 1;

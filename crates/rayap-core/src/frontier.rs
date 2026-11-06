@@ -1,8 +1,8 @@
 //! The crawl frontier: one FIFO queue per host plus a min-heap of hosts keyed by the
 //! earliest time each may be contacted again.
 //!
-//! A host is in the heap only while it is idle and has work, so `next` never returns a
-//! second URL for a host that already has a request in flight, and a host that must wait
+//! A host is in the heap only while it is idle and has work, so `next` never hands out a
+//! second item for a host that already has a request in flight, and a host that must wait
 //! (politeness delay, Retry-After, backoff) never blocks the others. All time is passed in,
 //! so the scheduling rules are testable without a clock.
 
@@ -11,41 +11,33 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use tokio::time::{Duration, Instant};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Task {
-    pub url: String,
-    pub source: String,
-    pub depth: u32,
-    pub attempts: u32,
-}
-
 #[derive(Debug, PartialEq, Eq)]
-pub enum Next {
+pub enum Next<T> {
     /// Contact `host` now. The host stays busy until `release`.
-    Ready { host: String, task: Task },
+    Ready { host: String, item: T },
     /// Nothing is ready; the earliest host becomes eligible at this instant.
     WaitUntil(Instant),
     /// No idle host has work (hosts with requests in flight may still have some).
     Idle,
 }
 
-struct Host {
-    queue: VecDeque<Task>,
+struct Host<T> {
+    queue: VecDeque<T>,
     next_allowed: Instant,
     delay: Duration,
     busy: bool,
     in_heap: bool,
 }
 
-pub struct Frontier {
-    hosts: HashMap<String, Host>,
+pub struct Frontier<T> {
+    hosts: HashMap<String, Host<T>>,
     ready: BinaryHeap<Reverse<(Instant, u64, String)>>,
     seq: u64,
     default_delay: Duration,
     pending: usize,
 }
 
-impl Frontier {
+impl<T> Frontier<T> {
     pub fn new(default_delay: Duration) -> Self {
         Self {
             hosts: HashMap::new(),
@@ -56,25 +48,25 @@ impl Frontier {
         }
     }
 
-    /// Tasks waiting in queues (not counting requests in flight).
+    /// Items waiting in queues (not counting requests in flight).
     pub fn pending(&self) -> usize {
         self.pending
     }
 
-    pub fn push(&mut self, host: &str, task: Task, now: Instant) {
-        self.host_mut(host, now).queue.push_back(task);
+    pub fn push(&mut self, host: &str, item: T, now: Instant) {
+        self.host_mut(host, now).queue.push_back(item);
         self.pending += 1;
         self.schedule(host);
     }
 
-    /// Puts a task back at the head of its host's queue (retries, robots.txt fetched first).
-    pub fn push_front(&mut self, host: &str, task: Task, now: Instant) {
-        self.host_mut(host, now).queue.push_front(task);
+    /// Puts an item at the head of its host's queue (retries, follow-up requests).
+    pub fn push_front(&mut self, host: &str, item: T, now: Instant) {
+        self.host_mut(host, now).queue.push_front(item);
         self.pending += 1;
         self.schedule(host);
     }
 
-    pub fn next(&mut self, now: Instant) -> Next {
+    pub fn next(&mut self, now: Instant) -> Next<T> {
         while let Some(Reverse((at, _, _))) = self.ready.peek() {
             if *at > now {
                 return Next::WaitUntil(*at);
@@ -87,21 +79,33 @@ impl Frontier {
                 .get_mut(&host)
                 .expect("heap only holds known hosts");
             state.in_heap = false;
-            if let Some(task) = state.queue.pop_front() {
+            if state.next_allowed > now {
+                // A hold arrived after the host was queued: re-queue at the new time.
+                self.schedule(&host);
+                continue;
+            }
+            if let Some(item) = state.queue.pop_front() {
                 state.busy = true;
                 self.pending -= 1;
-                return Next::Ready { host, task };
+                return Next::Ready { host, item };
             }
         }
         Next::Idle
     }
 
-    /// Marks the host idle again. Its next request may start `wait` after `now`.
+    /// Marks the host idle again. Its next request may start `wait` after `now`, or later
+    /// if a hold is in place.
     pub fn release(&mut self, host: &str, now: Instant, wait: Duration) {
         let state = self.host_mut(host, now);
         state.busy = false;
-        state.next_allowed = now + wait;
+        state.next_allowed = state.next_allowed.max(now + wait);
         self.schedule(host);
+    }
+
+    /// Keeps the host from being contacted before `until` (Retry-After, backoff).
+    pub fn hold(&mut self, host: &str, until: Instant, now: Instant) {
+        let state = self.host_mut(host, now);
+        state.next_allowed = state.next_allowed.max(until);
     }
 
     pub fn delay(&self, host: &str) -> Duration {
@@ -112,7 +116,7 @@ impl Frontier {
         self.host_mut(host, now).delay = delay;
     }
 
-    fn host_mut(&mut self, host: &str, now: Instant) -> &mut Host {
+    fn host_mut(&mut self, host: &str, now: Instant) -> &mut Host<T> {
         let default_delay = self.default_delay;
         self.hosts.entry(host.to_string()).or_insert_with(|| Host {
             queue: VecDeque::new(),
@@ -141,18 +145,9 @@ impl Frontier {
 mod tests {
     use super::*;
 
-    fn task(url: &str) -> Task {
-        Task {
-            url: url.into(),
-            source: "s".into(),
-            depth: 0,
-            attempts: 0,
-        }
-    }
-
-    fn ready_url(next: Next) -> String {
+    fn ready(next: Next<&'static str>) -> &'static str {
         match next {
-            Next::Ready { task, .. } => task.url,
+            Next::Ready { item, .. } => item,
             other => panic!("expected Ready, got {other:?}"),
         }
     }
@@ -161,10 +156,10 @@ mod tests {
     fn one_request_in_flight_per_host_and_delay_after_release() {
         let t0 = Instant::now();
         let mut f = Frontier::new(Duration::from_secs(2));
-        f.push("a.org", task("a1"), t0);
-        f.push("a.org", task("a2"), t0);
+        f.push("a.org", "a1", t0);
+        f.push("a.org", "a2", t0);
 
-        assert_eq!(ready_url(f.next(t0)), "a1");
+        assert_eq!(ready(f.next(t0)), "a1");
         assert_eq!(f.next(t0), Next::Idle, "a.org is busy");
 
         f.release("a.org", t0, f.delay("a.org"));
@@ -173,7 +168,7 @@ mod tests {
             f.next(t0 + Duration::from_millis(1999)),
             Next::WaitUntil(t0 + Duration::from_secs(2))
         );
-        assert_eq!(ready_url(f.next(t0 + Duration::from_secs(2))), "a2");
+        assert_eq!(ready(f.next(t0 + Duration::from_secs(2))), "a2");
         assert_eq!(f.pending(), 0);
     }
 
@@ -181,13 +176,13 @@ mod tests {
     fn a_waiting_host_does_not_block_others() {
         let t0 = Instant::now();
         let mut f = Frontier::new(Duration::from_secs(1));
-        f.push("slow.org", task("s1"), t0);
-        f.push("slow.org", task("s2"), t0);
-        f.push("fast.org", task("f1"), t0);
+        f.push("slow.org", "s1", t0);
+        f.push("slow.org", "s2", t0);
+        f.push("fast.org", "f1", t0);
 
-        assert_eq!(ready_url(f.next(t0)), "s1");
-        f.release("slow.org", t0, Duration::from_secs(3600)); // e.g. Retry-After: 3600
-        assert_eq!(ready_url(f.next(t0)), "f1");
+        assert_eq!(ready(f.next(t0)), "s1");
+        f.release("slow.org", t0, Duration::from_secs(3600));
+        assert_eq!(ready(f.next(t0)), "f1");
         assert_eq!(f.next(t0), Next::WaitUntil(t0 + Duration::from_secs(3600)));
     }
 
@@ -196,31 +191,51 @@ mod tests {
         let t0 = Instant::now();
         let mut f = Frontier::new(Duration::ZERO);
         for host in ["a", "b", "c"] {
-            f.push(host, task(host), t0);
+            f.push(host, host, t0);
         }
-        let order: Vec<String> = (0..3).map(|_| ready_url(f.next(t0))).collect();
+        let order: Vec<&str> = (0..3).map(|_| ready(f.next(t0))).collect();
         assert_eq!(order, ["a", "b", "c"]);
     }
 
     #[test]
-    fn push_front_retries_before_newer_work() {
+    fn push_front_goes_before_newer_work() {
         let t0 = Instant::now();
         let mut f = Frontier::new(Duration::ZERO);
-        f.push("a", task("first"), t0);
-        f.push("a", task("second"), t0);
-        let Next::Ready { task: t, .. } = f.next(t0) else {
+        f.push("a", "first", t0);
+        f.push("a", "second", t0);
+        let Next::Ready { item, .. } = f.next(t0) else {
             panic!()
         };
-        f.push_front("a", t, t0);
+        f.push_front("a", item, t0);
         assert_eq!(f.next(t0), Next::Idle, "still busy until released");
         f.release("a", t0, Duration::ZERO);
-        assert_eq!(ready_url(f.next(t0)), "first");
+        assert_eq!(ready(f.next(t0)), "first");
+    }
+
+    #[test]
+    fn hold_delays_a_queued_host_and_release_never_shortens_it() {
+        let t0 = Instant::now();
+        let mut f = Frontier::new(Duration::ZERO);
+        f.push("a", "a1", t0);
+        f.hold("a", t0 + Duration::from_secs(60), t0);
+        assert_eq!(
+            f.next(t0),
+            Next::WaitUntil(t0 + Duration::from_secs(60)),
+            "hold after queueing"
+        );
+
+        let t1 = t0 + Duration::from_secs(60);
+        assert_eq!(ready(f.next(t1)), "a1");
+        f.push("a", "a2", t1);
+        f.hold("a", t1 + Duration::from_secs(7200), t1);
+        f.release("a", t1, Duration::from_secs(1));
+        assert_eq!(f.next(t1), Next::WaitUntil(t1 + Duration::from_secs(7200)));
     }
 
     #[test]
     fn per_host_delay_can_be_raised() {
         let t0 = Instant::now();
-        let mut f = Frontier::new(Duration::from_secs(1));
+        let mut f: Frontier<()> = Frontier::new(Duration::from_secs(1));
         f.set_delay("a", Duration::from_secs(10), t0);
         assert_eq!(f.delay("a"), Duration::from_secs(10));
         assert_eq!(f.delay("other"), Duration::from_secs(1));

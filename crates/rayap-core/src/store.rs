@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS pages (
     url           TEXT PRIMARY KEY,
     source        TEXT NOT NULL,
     depth         INTEGER NOT NULL,
+    hops          INTEGER NOT NULL DEFAULT 0,
     queued_run    INTEGER NOT NULL,
     done_run      INTEGER,
     attempts      INTEGER NOT NULL DEFAULT 0,
@@ -34,6 +35,10 @@ CREATE TABLE IF NOT EXISTS pages (
     fetched_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS pages_pending ON pages (queued_run, done_run);
+CREATE TABLE IF NOT EXISTS host_holds (
+    host       TEXT PRIMARY KEY,
+    until_ms   INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id        INTEGER PRIMARY KEY,
     run       INTEGER NOT NULL,
@@ -125,7 +130,18 @@ pub struct PendingPage {
     pub url: String,
     pub source: String,
     pub depth: u32,
+    /// Redirects followed to reach this URL.
+    pub hops: u32,
     pub attempts: u32,
+}
+
+/// A URL found while handling a page (a link or a redirect target).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPage {
+    pub url: String,
+    pub source: String,
+    pub depth: u32,
+    pub hops: u32,
 }
 
 /// What a fetch produced, ready to be committed.
@@ -146,9 +162,13 @@ pub struct Store {
 }
 
 pub fn unix_now() -> i64 {
+    unix_now_ms() / 1000
+}
+
+pub fn unix_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 impl Store {
@@ -204,22 +224,15 @@ impl Store {
         Ok(())
     }
 
-    /// Adds `url` to run `run`. Returns true if it was not already part of the run, in which
+    /// Adds a page to run `run`. Returns true if it was not already part of the run, in which
     /// case the caller must put it in the frontier.
-    pub fn enqueue(&self, run: i64, url: &str, source: &str, depth: u32) -> Result<bool> {
-        let changed = self.conn.execute(
-            "INSERT INTO pages (url, source, depth, queued_run) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (url) DO UPDATE SET queued_run = excluded.queued_run, attempts = 0,
-                 source = excluded.source, depth = excluded.depth
-             WHERE pages.queued_run < excluded.queued_run",
-            params![url, source, depth, run],
-        )?;
-        Ok(changed > 0)
+    pub fn enqueue(&self, run: i64, page: &NewPage) -> Result<bool> {
+        enqueue_in(&self.conn, run, page)
     }
 
     pub fn pending(&self, run: i64) -> Result<Vec<PendingPage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT url, source, depth, attempts FROM pages
+            "SELECT url, source, depth, hops, attempts FROM pages
              WHERE queued_run = ?1 AND (done_run IS NULL OR done_run < ?1) ORDER BY rowid",
         )?;
         let rows = stmt.query_map([run], |r| {
@@ -227,7 +240,8 @@ impl Store {
                 url: r.get(0)?,
                 source: r.get(1)?,
                 depth: r.get(2)?,
-                attempts: r.get(3)?,
+                hops: r.get(3)?,
+                attempts: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -242,20 +256,50 @@ impl Store {
         Ok(())
     }
 
-    /// Commits the page outcome and its event atomically and returns the event.
-    /// For content outcomes (`hash` is set) the kind is decided here, from the stored hash:
-    /// `New`, `Changed` or `Unchanged`. Other kinds are taken as given.
+    /// Commits the page outcome, its event and the pages it led to, in one transaction.
+    /// Returns the event and the discovered pages that are new to this run (to be put in the
+    /// frontier). For content outcomes (`hash` is set) the kind is decided here from the
+    /// stored hash: `New`, `Changed` or `Unchanged`. Other kinds are taken as given.
     pub fn complete(
         &mut self,
         run: i64,
         url: &str,
         kind: Option<EventKind>,
         outcome: Outcome,
-    ) -> Result<Event> {
+        discovered: Vec<NewPage>,
+    ) -> Result<(Event, Vec<NewPage>)> {
         let tx = self.conn.transaction()?;
         let event = complete_in(&tx, run, url, kind, outcome)?;
+        let mut added = Vec::new();
+        for page in discovered {
+            if enqueue_in(&tx, run, &page)? {
+                added.push(page);
+            }
+        }
         tx.commit()?;
-        Ok(event)
+        Ok((event, added))
+    }
+
+    /// Persists that `host` must not be contacted before `until_ms` (Unix milliseconds).
+    /// An existing later hold is kept.
+    pub fn hold_host(&self, host: &str, until_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO host_holds (host, until_ms) VALUES (?1, ?2)
+             ON CONFLICT (host) DO UPDATE SET until_ms = max(until_ms, excluded.until_ms)",
+            params![host, until_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Holds that have not expired yet, as (host, until_ms).
+    pub fn active_holds(&self) -> Result<Vec<(String, i64)>> {
+        self.conn.execute(
+            "DELETE FROM host_holds WHERE until_ms <= ?1",
+            [unix_now_ms()],
+        )?;
+        let mut stmt = self.conn.prepare("SELECT host, until_ms FROM host_holds")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Events with `id > after`, oldest first.
@@ -282,6 +326,17 @@ impl Store {
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
+}
+
+fn enqueue_in(conn: &Connection, run: i64, page: &NewPage) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT INTO pages (url, source, depth, hops, queued_run) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (url) DO UPDATE SET queued_run = excluded.queued_run, attempts = 0,
+             source = excluded.source, depth = excluded.depth, hops = excluded.hops
+         WHERE pages.queued_run < excluded.queued_run",
+        params![page.url, page.source, page.depth, page.hops, run],
+    )?;
+    Ok(changed > 0)
 }
 
 fn complete_in(
@@ -345,6 +400,19 @@ fn complete_in(
 mod tests {
     use super::*;
 
+    fn page(url: &str) -> NewPage {
+        NewPage {
+            url: url.into(),
+            source: "src".into(),
+            depth: 0,
+            hops: 0,
+        }
+    }
+
+    fn done(s: &mut Store, run: i64, url: &str, outcome: Outcome) -> Event {
+        s.complete(run, url, None, outcome, Vec::new()).unwrap().0
+    }
+
     fn content(hash: &str) -> Outcome {
         Outcome {
             status: Some(200),
@@ -358,15 +426,13 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let (r1, resumed) = s.begin_run(&["src"]).unwrap();
         assert!(!resumed);
-        assert!(s.enqueue(r1, "https://a.org/", "src", 0).unwrap());
+        assert!(s.enqueue(r1, &page("https://a.org/")).unwrap());
         assert!(
-            !s.enqueue(r1, "https://a.org/", "src", 0).unwrap(),
+            !s.enqueue(r1, &page("https://a.org/")).unwrap(),
             "already in this run"
         );
         assert_eq!(
-            s.complete(r1, "https://a.org/", None, content("h1"))
-                .unwrap()
-                .kind,
+            done(&mut s, r1, "https://a.org/", content("h1")).kind,
             EventKind::New
         );
         s.finish_run(r1).unwrap();
@@ -378,17 +444,13 @@ mod tests {
             "known pages are re-queued in a new run"
         );
         assert_eq!(
-            s.complete(r2, "https://a.org/", None, content("h1"))
-                .unwrap()
-                .kind,
+            done(&mut s, r2, "https://a.org/", content("h1")).kind,
             EventKind::Unchanged
         );
         s.finish_run(r2).unwrap();
 
         let (r3, _) = s.begin_run(&["src"]).unwrap();
-        let e = s
-            .complete(r3, "https://a.org/", None, content("h2"))
-            .unwrap();
+        let e = done(&mut s, r3, "https://a.org/", content("h2"));
         assert_eq!(
             (e.kind, e.prev_hash.as_deref()),
             (EventKind::Changed, Some("h1"))
@@ -399,9 +461,8 @@ mod tests {
     fn errors_keep_the_last_good_fingerprint() {
         let mut s = Store::open_in_memory().unwrap();
         let (r1, _) = s.begin_run(&["src"]).unwrap();
-        s.enqueue(r1, "https://a.org/", "src", 0).unwrap();
-        s.complete(r1, "https://a.org/", None, content("h1"))
-            .unwrap();
+        s.enqueue(r1, &page("https://a.org/")).unwrap();
+        done(&mut s, r1, "https://a.org/", content("h1"));
         s.finish_run(r1).unwrap();
 
         let (r2, _) = s.begin_run(&["src"]).unwrap();
@@ -410,18 +471,23 @@ mod tests {
             ..Outcome::default()
         };
         assert_eq!(
-            s.complete(r2, "https://a.org/", Some(EventKind::Gone), gone)
-                .unwrap()
-                .kind,
+            s.complete(
+                r2,
+                "https://a.org/",
+                Some(EventKind::Gone),
+                gone,
+                Vec::new()
+            )
+            .unwrap()
+            .0
+            .kind,
             EventKind::Gone
         );
         s.finish_run(r2).unwrap();
 
         let (r3, _) = s.begin_run(&["src"]).unwrap();
         assert_eq!(
-            s.complete(r3, "https://a.org/", None, content("h1"))
-                .unwrap()
-                .kind,
+            done(&mut s, r3, "https://a.org/", content("h1")).kind,
             EventKind::Unchanged
         );
     }
@@ -434,10 +500,9 @@ mod tests {
             let mut s = Store::open(&path).unwrap();
             let (r1, _) = s.begin_run(&["src"]).unwrap();
             for u in ["https://a.org/1", "https://a.org/2"] {
-                s.enqueue(r1, u, "src", 0).unwrap();
+                s.enqueue(r1, &page(u)).unwrap();
             }
-            s.complete(r1, "https://a.org/1", None, content("h"))
-                .unwrap();
+            done(&mut s, r1, "https://a.org/1", content("h"));
             s.record_attempt("https://a.org/2", 2).unwrap();
             // process stops here without finish_run
         }
@@ -450,6 +515,7 @@ mod tests {
                 url: "https://a.org/2".into(),
                 source: "src".into(),
                 depth: 0,
+                hops: 0,
                 attempts: 2
             }]
         );
@@ -459,12 +525,49 @@ mod tests {
     fn removed_sources_are_not_requeued() {
         let mut s = Store::open_in_memory().unwrap();
         let (r1, _) = s.begin_run(&["old"]).unwrap();
-        s.enqueue(r1, "https://a.org/", "old", 0).unwrap();
-        s.complete(r1, "https://a.org/", None, content("h"))
-            .unwrap();
+        s.enqueue(
+            r1,
+            &NewPage {
+                source: "old".into(),
+                ..page("https://a.org/")
+            },
+        )
+        .unwrap();
+        done(&mut s, r1, "https://a.org/", content("h"));
         s.finish_run(r1).unwrap();
         let (r2, _) = s.begin_run(&["new"]).unwrap();
         assert!(s.pending(r2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn discovered_pages_commit_with_the_outcome() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (r, _) = s.begin_run(&["src"]).unwrap();
+        s.enqueue(r, &page("https://a.org/")).unwrap();
+        let links = vec![
+            page("https://a.org/1"),
+            page("https://a.org/"),
+            page("https://a.org/1"),
+        ];
+        let (_, added) = s
+            .complete(r, "https://a.org/", None, content("h"), links)
+            .unwrap();
+        assert_eq!(
+            added,
+            [page("https://a.org/1")],
+            "only pages new to the run are returned"
+        );
+        assert_eq!(s.pending(r).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn host_holds_persist_and_keep_the_later_time() {
+        let s = Store::open_in_memory().unwrap();
+        let far = unix_now_ms() + 3_600_000;
+        s.hold_host("a.org", far).unwrap();
+        s.hold_host("a.org", far - 1000).unwrap();
+        s.hold_host("old.org", unix_now_ms() - 1).unwrap();
+        assert_eq!(s.active_holds().unwrap(), [("a.org".to_string(), far)]);
     }
 
     #[test]
@@ -472,8 +575,8 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let (r, _) = s.begin_run(&["src"]).unwrap();
         for u in ["https://a.org/1", "https://a.org/2", "https://a.org/3"] {
-            s.enqueue(r, u, "src", 0).unwrap();
-            s.complete(r, u, None, content(u)).unwrap();
+            s.enqueue(r, &page(u)).unwrap();
+            done(&mut s, r, u, content(u));
         }
         let first = s.events_after(0, 2).unwrap();
         assert_eq!(first.len(), 2);

@@ -1,6 +1,6 @@
-//! HTTP fetching. Page requests never follow redirects automatically: the target is
-//! returned to the crawler, which queues it so it passes the same robots.txt and politeness
-//! checks as any other URL.
+//! HTTP fetching. Redirects are never followed automatically: the target is returned to the
+//! crawler, which queues it so it passes the same robots.txt and politeness checks as any
+//! other request.
 
 use std::time::{Duration, SystemTime};
 
@@ -8,30 +8,38 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATIO
 use reqwest::{Client, Response, redirect};
 use url::Url;
 
-use crate::robots::{self, MAX_ROBOTS_BYTES};
+use crate::robots::MAX_ROBOTS_BYTES;
 use crate::{Config, Result, urlnorm};
 
 pub struct Clients {
-    page: Client,
-    robots: Client,
+    http: Client,
 }
 
 impl Clients {
     pub fn new(config: &Config) -> Result<Self> {
-        let build = |policy| {
-            Client::builder()
-                .user_agent(config.user_agent())
-                .timeout(config.request_timeout())
-                .connect_timeout(config.request_timeout().min(Duration::from_secs(10)))
-                .redirect(policy)
-                .build()
-        };
-        Ok(Self {
-            page: build(redirect::Policy::none())?,
-            // RFC 9309 §2.3.1.2: follow at least five consecutive redirects for robots.txt.
-            robots: build(redirect::Policy::limited(5))?,
-        })
+        let http = Client::builder()
+            .user_agent(config.user_agent())
+            .timeout(config.request_timeout())
+            .connect_timeout(config.request_timeout().min(Duration::from_secs(10)))
+            // Every redirect hop goes back through the scheduler, so it gets the same
+            // politeness and robots.txt checks as any other request.
+            .redirect(redirect::Policy::none())
+            .build()?;
+        Ok(Self { http })
     }
+}
+
+#[derive(Debug)]
+pub enum RobotsResult {
+    /// 3xx with the resolved Location, if usable.
+    Redirect(Option<Url>),
+    /// Any other HTTP response. `body` is read only for 2xx (first 500 KiB).
+    Response {
+        status: u16,
+        body: Vec<u8>,
+        retry_after: Option<Duration>,
+    },
+    Network(String),
 }
 
 #[derive(Debug)]
@@ -63,7 +71,7 @@ pub enum PageResult {
 }
 
 pub async fn fetch_page(clients: &Clients, url: &Url, max_body: usize) -> PageResult {
-    let response = match clients.page.get(url.clone()).send().await {
+    let response = match clients.http.get(url.clone()).send().await {
         Ok(r) => r,
         Err(e) => return PageResult::Network(describe(&e)),
     };
@@ -107,30 +115,35 @@ pub async fn fetch_page(clients: &Clients, url: &Url, max_body: usize) -> PageRe
     }
 }
 
-pub async fn fetch_robots(clients: &Clients, origin: &str, product_token: &str) -> robots::Fetched {
-    let url = format!("{origin}/robots.txt");
-    let response = match clients.robots.get(&url).send().await {
+pub async fn fetch_robots(clients: &Clients, url: &str) -> RobotsResult {
+    let Ok(parsed) = Url::parse(url) else {
+        return RobotsResult::Network(format!("invalid robots.txt URL {url}"));
+    };
+    let response = match clients.http.get(parsed.clone()).send().await {
         Ok(r) => r,
-        Err(e) => {
-            return robots::Fetched::Unreachable {
-                reason: format!("robots.txt: {}", describe(&e)),
-            };
-        }
+        Err(e) => return RobotsResult::Network(describe(&e)),
     };
     let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        let location = header(response.headers(), LOCATION.as_str())
+            .and_then(|l| urlnorm::normalize(&l, Some(&parsed)));
+        return RobotsResult::Redirect(location);
+    }
+    let retry_after = header(response.headers(), RETRY_AFTER.as_str())
+        .and_then(|v| parse_retry_after(&v, SystemTime::now()));
     let body = if (200..300).contains(&status) {
         match read_prefix(response, MAX_ROBOTS_BYTES).await {
             Ok(body) => body,
-            Err(e) => {
-                return robots::Fetched::Unreachable {
-                    reason: format!("robots.txt: {e}"),
-                };
-            }
+            Err(e) => return RobotsResult::Network(e),
         }
     } else {
         Vec::new()
     };
-    robots::interpret(status, &body, product_token)
+    RobotsResult::Response {
+        status,
+        body,
+        retry_after,
+    }
 }
 
 fn header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {

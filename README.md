@@ -14,21 +14,27 @@ interrupted crawl resumes where it stopped and the next run reports only what ch
 - **One request at a time per host**, with a configurable delay between requests
   (default 2 s). A slow or rate-limited host never holds up the others: hosts wait in a
   min-heap keyed by the time they may next be contacted.
-- **robots.txt per RFC 9309**: fetched before any page on an origin, cached at most 24 hours,
-  first 500 KiB parsed. Rules for the `rayap` product token win over `*`. A 4xx robots.txt
-  allows everything; a 5xx or network failure blocks the origin. `Crawl-delay` is honoured,
-  capped by `max_crawl_delay_ms`.
-- **Backs off when asked**: `429` and `503` wait for `Retry-After` (seconds or HTTP date);
-  network errors and other 5xx retry with growing backoff, up to `max_attempts`.
+- **robots.txt per RFC 9309**, with rayap's own parser: fetched before any page on an
+  origin, cached at most 24 hours, first 500 KiB parsed. Groups for the `rayap` product token
+  win over `*`; longest match wins, allow wins ties; `*` and `$` supported; percent-encoding
+  is normalized, so `/%70rivate` is `/private`. A 4xx robots.txt allows everything; a 429,
+  5xx or network failure keeps the origin's pages waiting and is retried with backoff, and
+  only after `max_attempts` failures are the pages reported as blocked. Each robots.txt
+  redirect hop (up to 5) is scheduled like any other request. Malformed or hostile rules
+  never widen access. `Crawl-delay` is honoured per origin, capped by `max_crawl_delay_ms`.
+- **Backs off when asked**: `429` and `503` hold the whole host for the full `Retry-After`
+  (seconds or HTTP date); network errors and other 5xx retry with growing backoff, up to
+  `max_attempts`. Holds are stored, so a restart never contacts a host early.
 - **Redirects are not followed blindly**: the target is queued as its own page, so it passes
-  robots.txt and politeness checks for its own host.
+  robots.txt and politeness checks for its own host. Chains stop after 10 hops, and links are
+  only followed on the source's own host.
 - **Identifies itself**: `Mozilla/5.0 (compatible; rayap/0.1.0; +<your contact>)`. A contact
   is required.
 - **Public pages only**: no logins, forms or CAPTCHAs.
 - **Change detection ignores noise**: the fingerprint covers the page title and body text, not
   scripts, styles or markup, so a new tracking snippet is not a change.
-- **At-least-once and resumable**: each outcome and its event are committed in one SQLite
-  transaction. If the process stops, the next start resumes the run and fetches only the
+- **At-least-once and resumable**: each outcome, its event and the links it found are
+  committed in one SQLite transaction. If the process stops, the next start resumes the run and fetches only the
   pages that have no outcome yet.
 
 ## Use
@@ -69,7 +75,7 @@ An event:
 |---|---|
 | `crates/rayap-core/src/frontier.rs` | per-host queues and the earliest-eligible-host heap |
 | `crates/rayap-core/src/crawler.rs` | the crawl loop: scheduling, robots.txt gate, retries |
-| `crates/rayap-core/src/robots.rs` | RFC 9309 interpretation (parsing by `texting_robots`) |
+| `crates/rayap-core/src/robots.rs` | RFC 9309 parser and matcher |
 | `crates/rayap-core/src/store.rs` | SQLite state, runs, resumable progress, events |
 | `crates/rayap-core/src/html.rs` | streaming extraction (title, text, links, nofollow) with `lol_html` |
 | `crates/rayap-core/tests/crawl.rs` | end-to-end tests against a local server |
