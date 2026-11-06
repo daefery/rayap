@@ -5,6 +5,8 @@
 //! - `scheduler`: only the frontier, with simulated request durations and no I/O, to show
 //!   what the scheduling core alone can sustain.
 
+mod freshness;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -53,6 +55,28 @@ enum Mode {
         /// enforces --delay-ms, to check that the referee catches a crawler that is too fast.
         #[arg(long)]
         crawler_delay_ms: Option<u64>,
+    },
+    /// Revisit policies under a fixed fetch budget, against pages with hidden change rates.
+    Freshness {
+        #[arg(long, default_value_t = 100_000)]
+        pages: usize,
+        /// Revisits per day as a share of the page count (0.2 = each page once per 5 days on average).
+        #[arg(long, default_value_t = 0.2)]
+        budget_per_page: f64,
+        #[arg(long, default_value_t = 60.0)]
+        days: f64,
+        #[arg(long, default_value_t = 20.0)]
+        warmup_days: f64,
+        /// Share of pages that never change.
+        #[arg(long, default_value_t = 0.3)]
+        static_share: f64,
+        /// Changing pages draw log10(rate per day) uniformly from [min, max].
+        #[arg(long, default_value_t = -2.0, allow_hyphen_values = true)]
+        log10_rate_min: f64,
+        #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
+        log10_rate_max: f64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
     },
     /// Scheduling core only: frontier with simulated request times, no network or storage.
     Scheduler {
@@ -147,6 +171,65 @@ fn machine() -> serde_json::Value {
 #[tokio::main]
 async fn main() {
     match Cli::parse().mode {
+        Mode::Freshness {
+            pages,
+            budget_per_page,
+            days,
+            warmup_days,
+            static_share,
+            log10_rate_min,
+            log10_rate_max,
+            seed,
+        } => {
+            let mut rng = freshness::Rng::new(seed);
+            let rates: Vec<f64> = (0..pages)
+                .map(|_| {
+                    if rng.unit() < static_share {
+                        0.0
+                    } else {
+                        10f64.powf(log10_rate_min + (log10_rate_max - log10_rate_min) * rng.unit())
+                    }
+                })
+                .collect();
+            let changes = freshness::change_times(&rates, days, seed.wrapping_add(1));
+            let setup = freshness::Setup {
+                rates: &rates,
+                changes: &changes,
+                days,
+                budget: budget_per_page * pages as f64,
+                warmup_days,
+                floor: 1.0 / 30.0,
+                prior: rayap_core::revisit::Prior {
+                    rate: 0.2,
+                    weight: 0.5,
+                },
+                seed,
+            };
+            let started = Instant::now();
+            let results: Vec<_> = [
+                freshness::Policy::Uniform,
+                freshness::Policy::Adaptive,
+                freshness::Policy::Oracle,
+            ]
+            .into_iter()
+            .map(|p| freshness::run(p, &setup))
+            .collect();
+            let report = json!({
+                "mode": "freshness",
+                "provenance": { "rayap_revision": option_env!("RAYAP_REVISION").unwrap_or("unknown") },
+                "params": {
+                    "pages": pages, "budget_per_page_per_day": budget_per_page, "days": days,
+                    "warmup_days": warmup_days, "static_share": static_share,
+                    "log10_rate_per_day": [log10_rate_min, log10_rate_max], "seed": seed,
+                    "floor_per_day": 1.0 / 30.0, "prior": { "rate_per_day": 0.2, "weight": 0.5 },
+                    "replan_every_days": 1,
+                },
+                "true_changes_total": changes.iter().map(Vec::len).sum::<usize>(),
+                "results": results,
+                "wall_seconds": round(started.elapsed().as_secs_f64()),
+            });
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
         Mode::Scheduler {
             hosts,
             pages_per_host,

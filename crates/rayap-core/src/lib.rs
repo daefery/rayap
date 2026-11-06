@@ -11,6 +11,7 @@ pub mod crawler;
 mod fetch;
 pub mod frontier;
 pub mod html;
+pub mod revisit;
 pub mod robots;
 pub mod store;
 pub mod urlnorm;
