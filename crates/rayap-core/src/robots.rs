@@ -190,7 +190,7 @@ pub fn parse(body: &[u8], product_token: &str) -> Rules {
     let token = product_token.to_ascii_lowercase();
     let ours: Vec<&Group> = groups
         .iter()
-        .filter(|g| g.agents.iter().any(|a| *a == token))
+        .filter(|g| g.agents.contains(&token))
         .collect();
     let selected = if ours.is_empty() {
         groups
