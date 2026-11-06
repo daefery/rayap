@@ -6,8 +6,18 @@ rayap crawls a list of sources and writes one JSON event per page: `new`, `chang
 `unchanged`, `redirect`, `gone`, `blocked` or `error`. Its state lives in SQLite, so an
 interrupted crawl resumes where it stopped and the next run reports only what changed.
 
-> Status: early. The engine core and CLI work and are tested. The benchmark against a
-> simulated web is the next milestone; until it exists, this README makes no speed claims.
+> Status: early. The engine core and CLI work and are tested.
+
+## Measured
+
+On a simulated web of 10,000 hosts with injected latency, errors, 429s, redirects and
+robots.txt rules, one rayap process on a laptop (i7-12650H, WSL2) sustained a median of
+**3,839 pages/s** fetched, parsed and committed to SQLite across 3 runs, with a 2 s
+per-host delay, about 0.8 CPU cores, and **zero politeness violations** counted by an
+independent referee. 100 million pages a day is 1,157 pages/s. This is a loopback
+simulation, not the public internet: [bench/README.md](bench/README.md) has the setup,
+every raw result, a before/after optimisation, a scaling table that shows where a single
+coordinator stops scaling (about 20,000 hosts), and the limits.
 
 ## How it behaves
 
@@ -82,12 +92,13 @@ An event:
 | `crates/rayap-core/src/html.rs` | streaming extraction (title, text, links, nofollow) with `lol_html` |
 | `crates/rayap-core/tests/crawl.rs` | end-to-end tests against a local server |
 | `crates/rayap-cli` | the `rayap` command |
+| `crates/rayap-sim` | simulated web plus an independent politeness referee |
+| `crates/rayap-bench` | end-to-end and scheduler-only benchmarks, with flamegraphs |
 
 ## Roadmap
 
-1. Simulated web of 10,000 hosts with injected latency, errors and slow bodies; a benchmark
-   that reports scheduler-only and end-to-end pages/s separately, with hardware, assumptions
-   and politeness violations.
+1. Batched commits and several coordinators sharded by host, to scale past one
+   coordinator (see "What breaks first" in the benchmark).
 2. Conditional requests (`If-None-Match`, `If-Modified-Since`) and bytes per check.
 3. Signed requests (RFC 9421 HTTP Message Signatures, Web Bot Auth), so sites can verify rayap.
 4. Adaptive revisits: learn how often each page changes and spend requests where changes happen.

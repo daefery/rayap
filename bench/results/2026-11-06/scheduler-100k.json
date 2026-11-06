@@ -1,0 +1,24 @@
+{
+  "cpu_seconds": 5.42,
+  "machine": {
+    "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+    "kernel": "6.18.58.1-microsoft-standard-WSL2",
+    "logical_cpus": 16,
+    "mem_gib": 13.7
+  },
+  "mode": "scheduler",
+  "note": "No network, parsing or storage. Measures the frontier only.",
+  "pages": 5000000,
+  "params": {
+    "delay_ms": 2000,
+    "hosts": 100000,
+    "in_flight": 100000,
+    "pages_per_host": 50,
+    "request_ms": 200
+  },
+  "peak_rss_mib": 61.39,
+  "scheduling_decisions_per_wall_second": 821482.0,
+  "virtual_pages_per_second": 46296.3,
+  "virtual_seconds": 108.0,
+  "wall_seconds": 6.09
+}
