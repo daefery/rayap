@@ -510,17 +510,19 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             }
             robots::Fetched::Unreachable { reason } => {
                 let failures = self.robots_failures.remove(&origin).unwrap_or(0) + 1;
-                self.store
-                    .record_robots_failure(self.run, &origin, failures)?;
                 let wait = self
                     .frontier
                     .delay(&origin_host)
                     .max(self.config.retry_backoff() * failures);
+                // Hold first, as for page retries: a crash between the two writes must not
+                // leave a recorded failure without its backoff.
                 self.hold(&origin_host, now, wait)?;
+                self.store
+                    .record_robots_failure(self.run, &origin, failures)?;
                 self.robots.insert(
                     origin.clone(),
                     RobotsState::Unreachable {
-                        until: now + wait,
+                        until: deadline(now, wait),
                         reason,
                         failures,
                     },
