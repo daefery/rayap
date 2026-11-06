@@ -2,6 +2,7 @@
 //! crawler, which queues it so it passes the same robots.txt and politeness checks as any
 //! other request.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION, RETRY_AFTER};
@@ -16,8 +17,12 @@ pub struct Clients {
 }
 
 impl Clients {
-    pub fn new(config: &Config) -> Result<Self> {
-        let http = Client::builder()
+    pub fn new(config: &Config, resolver: Option<Arc<dyn reqwest::dns::Resolve>>) -> Result<Self> {
+        let mut builder = Client::builder();
+        if let Some(resolver) = resolver {
+            builder = builder.dns_resolver(resolver);
+        }
+        let http = builder
             .user_agent(config.user_agent())
             .timeout(config.request_timeout())
             .connect_timeout(config.request_timeout().min(Duration::from_secs(10)))

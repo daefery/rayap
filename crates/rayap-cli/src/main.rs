@@ -91,13 +91,21 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
             let mut store = Store::open(&db).map_err(|e| e.to_string())?;
             let mut out = io::stdout().lock();
             let mut write_error = None;
-            let stats = crawl(&config, &mut store, Options { max_fetches }, |event| {
-                let wanted =
-                    !changes_only || matches!(event.kind, EventKind::New | EventKind::Changed);
-                if wanted && write_error.is_none() {
-                    write_error = write_event(&mut out, event).err();
-                }
-            })
+            let stats = crawl(
+                &config,
+                &mut store,
+                Options {
+                    max_fetches,
+                    ..Options::default()
+                },
+                |event| {
+                    let wanted =
+                        !changes_only || matches!(event.kind, EventKind::New | EventKind::Changed);
+                    if wanted && write_error.is_none() {
+                        write_error = write_event(&mut out, event).err();
+                    }
+                },
+            )
             .await
             .map_err(|e| e.to_string())?;
             if let Some(e) = write_error {

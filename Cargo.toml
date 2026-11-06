@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rayap-core", "crates/rayap-cli"]
+members = ["crates/rayap-core", "crates/rayap-cli", "crates/rayap-sim", "crates/rayap-bench"]
 
 [workspace.package]
 edition = "2024"

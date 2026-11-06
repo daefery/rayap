@@ -1,0 +1,59 @@
+{
+  "crawler_cpu_cores_avg": 0.71,
+  "crawler_cpu_seconds": 205.38,
+  "crawler_peak_rss_mib": 1786.1,
+  "events": {
+    "blocked": 18315,
+    "gone": 3932,
+    "new": 395715,
+    "redirect": 3857
+  },
+  "finished": true,
+  "machine": {
+    "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
+    "kernel": "6.18.58.1-microsoft-standard-WSL2",
+    "logical_cpus": 16,
+    "mem_gib": 13.7
+  },
+  "mode": "e2e",
+  "pages_ok": 395715,
+  "pages_per_second": {
+    "overall": 1358.49,
+    "peak_1s": 2398,
+    "steady_state_mean": 1916.79,
+    "steady_state_p10": 1778,
+    "steady_state_p50": 1872,
+    "steady_window_seconds": 203
+  },
+  "params": {
+    "concurrency": 4096,
+    "delay_ms": 2000,
+    "hosts": 10000,
+    "max_depth": 2,
+    "sim_args": ""
+  },
+  "politeness_bound_pages_per_second": 5000.0,
+  "referee": {
+    "bytes_sent": 12148329280,
+    "hosts_contacted": 10000,
+    "min_gap_slack_ms": -1299,
+    "requests": 419622,
+    "robots_requests": 10092,
+    "status_200": 403745,
+    "unknown_host": 0,
+    "violations": {
+      "before_robots": 0,
+      "concurrent": 0,
+      "disallowed": 0,
+      "retry_after": 0,
+      "too_soon": 1
+    }
+  },
+  "seconds_to_90pct_of_pages": 190.0,
+  "stats": {
+    "bytes": 12148054785,
+    "events": 421819,
+    "requests": 409530
+  },
+  "wall_seconds": 291.29
+}

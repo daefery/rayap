@@ -39,11 +39,22 @@ fn deadline(now: Instant, wait: Duration) -> Instant {
     now.checked_add(wait).unwrap_or_else(|| now + FAR_FUTURE)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     /// Stop after this many page requests (robots.txt requests not counted). Useful for tests
     /// and trial runs; an interrupted run resumes next time.
     pub max_fetches: Option<u64>,
+    /// Replaces system DNS (benchmarks point simulated host names at a local server).
+    pub resolver: Option<Arc<dyn reqwest::dns::Resolve>>,
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("max_fetches", &self.max_fetches)
+            .field("resolver", &self.resolver.as_ref().map(|_| "custom"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -156,7 +167,7 @@ pub async fn crawl<F: FnMut(&Event)>(
     options: Options,
     on_event: F,
 ) -> Result<Stats> {
-    let clients = Arc::new(Clients::new(config)?);
+    let clients = Arc::new(Clients::new(config, options.resolver.clone())?);
     let sources: Vec<&str> = config.sources.iter().map(|s| s.name.as_str()).collect();
     let (run, resumed) = store.begin_run(&sources)?;
     let mut seed_hosts = HashMap::new();

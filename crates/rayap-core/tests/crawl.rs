@@ -427,6 +427,7 @@ async fn interrupted_run_resumes_without_refetching_finished_pages() {
             &mut store,
             Options {
                 max_fetches: Some(2),
+                ..Options::default()
             },
         )
         .await;
@@ -556,6 +557,7 @@ async fn retry_after_survives_a_restart() {
             &mut store,
             Options {
                 max_fetches: Some(2),
+                ..Options::default()
             },
         )
         .await;
