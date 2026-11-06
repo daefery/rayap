@@ -1,5 +1,5 @@
 {
-  "cpu_seconds": 5.42,
+  "cpu_seconds": 4.49,
   "machine": {
     "cpu": "12th Gen Intel(R) Core(TM) i7-12650H",
     "kernel": "6.18.58.1-microsoft-standard-WSL2",
@@ -16,9 +16,9 @@
     "pages_per_host": 50,
     "request_ms": 200
   },
-  "peak_rss_mib": 61.39,
-  "scheduling_decisions_per_wall_second": 821482.0,
+  "peak_rss_mib": 61.29,
+  "scheduling_decisions_per_wall_second": 1108977.0,
   "virtual_pages_per_second": 46296.3,
   "virtual_seconds": 108.0,
-  "wall_seconds": 6.09
+  "wall_seconds": 4.51
 }

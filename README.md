@@ -11,13 +11,22 @@ interrupted crawl resumes where it stopped and the next run reports only what ch
 ## Measured
 
 On a simulated web of 10,000 hosts with injected latency, errors, 429s, redirects and
-robots.txt rules, one rayap process on a laptop (i7-12650H, WSL2) sustained a median of
-**3,839 pages/s** fetched, parsed and committed to SQLite across 3 runs, with a 2 s
-per-host delay, about 0.8 CPU cores, and **zero politeness violations** counted by an
-independent referee. 100 million pages a day is 1,157 pages/s. This is a loopback
-simulation, not the public internet: [bench/README.md](bench/README.md) has the setup,
-every raw result, a before/after optimisation, a scaling table that shows where a single
-coordinator stops scaling (about 20,000 hosts), and the limits.
+robots.txt rules, one rayap process on a laptop (i7-12650H, WSL2) fetched, parsed and
+committed to SQLite at:
+
+- **about 3,900 pages/s in the steady window** (median 3,940 of 3 runs; windows of
+  63–99 s);
+- **about 1,740 pages/s over the whole crawl** (227 s), including the tail of slow and
+  Crawl-delayed hosts;
+- with a 2 s per-host delay and **zero politeness violations** counted by an independent
+  referee.
+
+100 million pages a day is 1,157 pages/s. This is a loopback simulation, not the public
+internet. [bench/README.md](bench/README.md) has:
+- the setup and every raw result with its command;
+- a before/after optimisation;
+- a scaling table showing where one coordinator stops scaling (about 20,000 hosts);
+- the limits.
 
 ## How it behaves
 

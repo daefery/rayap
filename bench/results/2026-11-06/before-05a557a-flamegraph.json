@@ -1,7 +1,7 @@
 {
-  "crawler_cpu_cores_avg": 0.79,
-  "crawler_cpu_seconds": 257.38,
-  "crawler_peak_rss_mib": 2053.6,
+  "crawler_cpu_cores_avg": 0.75,
+  "crawler_cpu_seconds": 213.62,
+  "crawler_peak_rss_mib": 1780.3,
   "events": {
     "blocked": 18315,
     "gone": 3932,
@@ -18,12 +18,12 @@
   "mode": "e2e",
   "pages_ok": 395715,
   "pages_per_second": {
-    "overall": 1212.3,
-    "peak_1s": 2042,
-    "steady_state_mean": 1568.54,
-    "steady_state_p10": 1306,
-    "steady_state_p50": 1509,
-    "steady_window_seconds": 249
+    "overall": 1380.12,
+    "peak_1s": 2331,
+    "steady_state_mean": 1968.76,
+    "steady_state_p10": 1878,
+    "steady_state_p50": 1978,
+    "steady_window_seconds": 198
   },
   "params": {
     "concurrency": 4096,
@@ -50,11 +50,11 @@
       "too_soon": 0
     }
   },
-  "seconds_to_90pct_of_pages": 234.0,
+  "seconds_to_90pct_of_pages": 185.0,
   "stats": {
     "bytes": 12148054785,
     "events": 421819,
     "requests": 409530
   },
-  "wall_seconds": 326.42
+  "wall_seconds": 286.73
 }
