@@ -666,3 +666,101 @@ async fn cross_host_robots_redirect_applies_crawl_delay_to_the_origin() {
         "page fetched before the origin's Crawl-delay"
     );
 }
+
+/// A Retry-After beyond max_wait ends each run after one robots.txt attempt; the failures
+/// must still add up across resumed runs.
+#[tokio::test]
+async fn robots_failures_add_up_across_resumed_runs() {
+    let site = Site::default();
+    site.set("/robots.txt", Reply::Status(503));
+    site.set("/", Reply::Html("<p>x</p>".into()));
+    let addr = start(site.clone()).await;
+    let mut cfg = config(addr, 0, 0);
+    // Each failure holds the host for 400 ms, longer than max_wait, so every run ends after
+    // one attempt and the next run (after the hold) makes the next attempt.
+    cfg.crawler.retry_backoff_ms = 400;
+    cfg.crawler.max_wait_ms = 0;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let mut all = Vec::new();
+    for _ in 0..6 {
+        let mut store = Store::open(&db).unwrap();
+        let (stats, events) = run(&cfg, &mut store, Options::default()).await;
+        all.extend(events);
+        if stats.finished {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    }
+    assert_eq!(kinds(&all), [("/".into(), EventKind::Blocked)]);
+    let robots = site
+        .requests()
+        .iter()
+        .filter(|p| *p == "/robots.txt")
+        .count();
+    assert_eq!(robots, 3, "max_attempts = 3 across runs");
+}
+
+#[tokio::test]
+async fn panicking_event_callback_still_leaves_the_host_delay_stored() {
+    let site = Site::default();
+    site.set("/", Reply::Html("<a href='/next'>n</a>".into()));
+    site.set("/next", Reply::Html("n".into()));
+    let addr = start(site.clone()).await;
+    let cfg = config(addr, 2_000, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    {
+        let cfg = cfg.clone();
+        let db = db.clone();
+        let crashed = tokio::spawn(async move {
+            let mut store = Store::open(&db).unwrap();
+            crawl(&cfg, &mut store, Options::default(), |_| {
+                panic!("consumer crashed")
+            })
+            .await
+        })
+        .await;
+        assert!(crashed.is_err(), "the callback panic propagates");
+    }
+    let crashed_at = *site.times().last().unwrap();
+    // Deterministic check: the host's delay is in the store even though the consumer crashed.
+    let hold_ms = Store::open(&db)
+        .unwrap()
+        .active_holds()
+        .unwrap()
+        .into_iter()
+        .find(|(h, _)| h == "127.0.0.1")
+        .map(|(_, until)| until - rayap_core::store::unix_now_ms())
+        .expect("no stored hold for the host after the crash");
+    assert!(hold_ms > 1500, "stored hold only {hold_ms} ms");
+    let mut store = Store::open(&db).unwrap();
+    run(&cfg, &mut store, Options::default()).await;
+    let first_after = site.times().into_iter().find(|t| *t > crashed_at).unwrap();
+    assert!(
+        first_after - crashed_at >= std::time::Duration::from_millis(1900),
+        "host contacted {:?} after the crash, before its 2 s delay",
+        first_after - crashed_at
+    );
+}
+
+#[tokio::test]
+async fn long_retry_after_is_stored_in_full() {
+    let site = Site::default();
+    site.set(
+        "/",
+        Reply::TooManyRequests {
+            retry_after: "3456000",
+            times: 1,
+        },
+    ); // 40 days
+    let addr = start(site.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let mut store = Store::open(&db).unwrap();
+    run(&config(addr, 0, 0), &mut store, Options::default()).await;
+    let holds = store.active_holds().unwrap();
+    let host_hold = holds.iter().find(|(h, _)| h == "127.0.0.1").unwrap().1;
+    let days = (host_hold - rayap_core::store::unix_now_ms()) as f64 / 86_400_000.0;
+    assert!(days > 39.9, "stored hold is {days:.1} days");
+}

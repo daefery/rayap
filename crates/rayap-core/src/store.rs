@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS pages (
     fetched_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS pages_pending ON pages (queued_run, done_run);
+CREATE TABLE IF NOT EXISTS robots_failures (
+    origin   TEXT PRIMARY KEY,
+    run      INTEGER NOT NULL,
+    failures INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS host_holds (
     host       TEXT PRIMARY KEY,
     until_ms   INTEGER NOT NULL
@@ -293,6 +298,32 @@ impl Store {
         Ok(())
     }
 
+    pub fn record_robots_failure(&self, run: i64, origin: &str, failures: u32) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO robots_failures (origin, run, failures) VALUES (?1, ?2, ?3)
+             ON CONFLICT (origin) DO UPDATE SET run = excluded.run, failures = excluded.failures",
+            params![origin, run, failures],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_robots_failures(&self, run: i64, origin: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM robots_failures WHERE origin = ?1 AND run = ?2",
+            params![origin, run],
+        )?;
+        Ok(())
+    }
+
+    /// robots.txt failure counts recorded in `run`, as (origin, failures).
+    pub fn robots_failures(&self, run: i64) -> Result<Vec<(String, u32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT origin, failures FROM robots_failures WHERE run = ?1")?;
+        let rows = stmt.query_map([run], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Holds that have not expired yet, as (host, until_ms).
     pub fn active_holds(&self) -> Result<Vec<(String, i64)>> {
         self.conn.execute(
@@ -331,12 +362,18 @@ impl Store {
 }
 
 /// Schema version stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Brings any older database up to `SCHEMA_VERSION`. Version 1 (the first release) had no
-/// `pages.hops` column and no `host_holds` table.
+/// `pages.hops` column; versions 1-2 lacked tables that `SCHEMA` creates if missing.
+/// A database from a newer rayap is refused rather than changed.
 fn migrate(tx: &Transaction) -> Result<()> {
     let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(crate::Error::Config(format!(
+            "database schema version {version} is newer than this rayap supports ({SCHEMA_VERSION}); upgrade rayap"
+        )));
+    }
     let has_pages: bool = tx.query_row(
         "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'pages'",
         [],
@@ -596,6 +633,36 @@ mod tests {
         assert_eq!(s.events_after(0, 10).unwrap().len(), 1, "old events kept");
         drop(s);
         Store::open(&path).unwrap(); // opening again is a no-op
+    }
+
+    #[test]
+    fn newer_schema_is_refused_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE pages (url TEXT); PRAGMA user_version = 99;")
+                .unwrap();
+        }
+        assert!(matches!(Store::open(&path), Err(crate::Error::Config(m)) if m.contains("newer")));
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 99);
+    }
+
+    #[test]
+    fn robots_failures_are_scoped_to_the_run() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_robots_failure(1, "https://a.org", 2).unwrap();
+        assert_eq!(
+            s.robots_failures(1).unwrap(),
+            [("https://a.org".to_string(), 2)]
+        );
+        assert!(s.robots_failures(2).unwrap().is_empty());
+        s.clear_robots_failures(1, "https://a.org").unwrap();
+        assert!(s.robots_failures(1).unwrap().is_empty());
     }
 
     #[test]

@@ -31,8 +31,13 @@ const SLOW_DOWN_DEFAULT: Duration = Duration::from_secs(60);
 const MAX_ROBOTS_HOPS: u32 = 5;
 /// Redirects followed from one source URL before the chain is reported as an error.
 const MAX_PAGE_HOPS: u32 = 10;
-/// Longest hold rayap represents; a longer Retry-After is treated as this long.
-const MAX_HOLD: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// In-memory stand-in for a hold too far away to add to the clock. The stored deadline is
+/// kept exact; this only decides that the host is not contacted in this run.
+const FAR_FUTURE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+fn deadline(now: Instant, wait: Duration) -> Instant {
+    now.checked_add(wait).unwrap_or_else(|| now + FAR_FUTURE)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -191,7 +196,18 @@ pub async fn crawl<F: FnMut(&Event)>(
     let (now, now_ms) = (Instant::now(), unix_now_ms());
     for (host, until_ms) in crawler.store.active_holds()? {
         let wait = Duration::from_millis(u64::try_from(until_ms - now_ms).unwrap_or(0));
-        crawler.frontier.hold(&host, now + wait.min(MAX_HOLD), now);
+        crawler.frontier.hold(&host, deadline(now, wait), now);
+    }
+    // robots.txt failures earlier in this run keep counting towards max_attempts.
+    for (origin, failures) in crawler.store.robots_failures(run)? {
+        crawler.robots.insert(
+            origin,
+            RobotsState::Unreachable {
+                until: now,
+                reason: "unreachable earlier in this run".into(),
+                failures,
+            },
+        );
     }
     for p in crawler.store.pending(run)? {
         if !config.sources.iter().any(|s| s.name == p.source) {
@@ -407,6 +423,13 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
 
     fn handle(&mut self, done: Done) -> Result<()> {
         let now = Instant::now();
+        // Store the host's ordinary delay before recording anything, so that whatever happens
+        // next (a crash, a panicking event callback) a restart still waits at least this long.
+        let host = match &done {
+            Done::Robots { host, .. } | Done::Page { host, .. } => host.clone(),
+        };
+        let delay = self.frontier.delay(&host);
+        self.hold(&host, now, delay)?;
         match done {
             Done::Robots {
                 host,
@@ -470,6 +493,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             .unwrap_or_else(|_| host.to_string());
         match fetched {
             robots::Fetched::Rules(rules) => {
+                self.store.clear_robots_failures(self.run, &origin)?;
                 let crawl_delay = rules.crawl_delay(self.config.max_crawl_delay());
                 match crawl_delay {
                     Some(d) => self.origin_delays.insert(origin.clone(), d),
@@ -486,6 +510,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             }
             robots::Fetched::Unreachable { reason } => {
                 let failures = self.robots_failures.remove(&origin).unwrap_or(0) + 1;
+                self.store
+                    .record_robots_failure(self.run, &origin, failures)?;
                 let wait = self
                     .frontier
                     .delay(&origin_host)
@@ -538,9 +564,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
     /// Keeps `host` from being contacted for `wait` after `now`, in memory and in the store,
     /// so a restart honours it too. Earlier holds that end later are kept.
     fn hold(&mut self, host: &str, now: Instant, wait: Duration) -> Result<()> {
-        let wait = wait.min(MAX_HOLD);
-        self.frontier.hold(host, now + wait, now);
-        let ms = i64::try_from(wait.as_millis()).unwrap_or(i64::MAX / 4);
+        self.frontier.hold(host, deadline(now, wait), now);
+        let ms = i64::try_from(wait.as_millis()).unwrap_or(i64::MAX);
         self.store.hold_host(host, unix_now_ms().saturating_add(ms))
     }
 
