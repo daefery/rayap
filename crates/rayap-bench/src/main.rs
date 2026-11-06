@@ -49,6 +49,10 @@ enum Mode {
         flamegraph: Option<PathBuf>,
         #[arg(long, default_value = "target/release/rayap-sim")]
         sim_bin: PathBuf,
+        /// Negative control: run the crawler with this per-host delay while the referee
+        /// enforces --delay-ms, to check that the referee catches a crawler that is too fast.
+        #[arg(long)]
+        crawler_delay_ms: Option<u64>,
     },
     /// Scheduling core only: frontier with simulated request times, no network or storage.
     Scheduler {
@@ -161,6 +165,7 @@ async fn main() {
             db,
             flamegraph,
             sim_bin,
+            crawler_delay_ms,
         } => {
             e2e(
                 sim_args,
@@ -171,6 +176,7 @@ async fn main() {
                 db,
                 flamegraph,
                 sim_bin,
+                crawler_delay_ms,
             )
             .await;
         }
@@ -270,7 +276,9 @@ async fn e2e(
     db: PathBuf,
     flamegraph: Option<PathBuf>,
     sim_bin: PathBuf,
+    crawler_delay_ms: Option<u64>,
 ) {
+    let crawler_delay = crawler_delay_ms.unwrap_or(delay_ms);
     // Start the simulator and wait for its address.
     let mut args: Vec<String> = sim_args.split_whitespace().map(String::from).collect();
     args.extend([
@@ -316,7 +324,7 @@ async fn e2e(
         r#"
         [crawler]
         contact = "mailto:bench@example.invalid"
-        per_host_delay_ms = {delay_ms}
+        per_host_delay_ms = {crawler_delay}
         max_concurrency = {concurrency}
         request_timeout_ms = 30000
         retry_backoff_ms = 2000
@@ -497,7 +505,7 @@ async fn e2e(
             "rayap_revision": option_env!("RAYAP_REVISION").unwrap_or("unknown"),
             "simulator_command": format!("{} {}", sim_bin.display(), sim_resolved.join(" ")),
             "simulator_spec": sim_spec,
-            "crawler_config": { "per_host_delay_ms": delay_ms, "max_concurrency": concurrency, "request_timeout_ms": 30000, "retry_backoff_ms": 2000, "max_wait_ms": 60000, "max_attempts": 3, "max_depth": 2, "sqlite": "WAL, synchronous=NORMAL" },
+            "crawler_config": { "per_host_delay_ms": crawler_delay, "referee_delay_ms": delay_ms, "max_concurrency": concurrency, "request_timeout_ms": 30000, "retry_backoff_ms": 2000, "max_wait_ms": 60000, "max_attempts": 3, "max_depth": 2, "sqlite": "WAL, synchronous=NORMAL" },
             "started_unix": started_unix,
         },
         "finished": stats.as_ref().is_some_and(|s| s.finished),

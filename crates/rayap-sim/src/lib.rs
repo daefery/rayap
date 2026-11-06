@@ -346,12 +346,16 @@ pub fn filler(len: usize) -> String {
 #[derive(Default)]
 struct HostWatch {
     in_flight: u32,
-    last_end: Option<Instant>,
+    /// The previous response ended somewhere in [earliest, latest]: after its last byte was
+    /// written and the last time unacknowledged bytes were seen, and no later than the first
+    /// time the send queue was seen empty.
+    last_end: Option<(Instant, Instant)>,
     last_path: String,
     last_status: u16,
     /// robots.txt has been served with 200, so the crawler knows its Crawl-delay.
     rules_served: bool,
-    not_before: Option<Instant>,
+    /// Retry-After expiry, as a window matching the end window of the 429 response.
+    not_before: Option<(Instant, Instant)>,
     /// What the last completed robots.txt response permits.
     robots: RobotsSeen,
     attempts: HashMap<String, u32>,
@@ -385,6 +389,14 @@ pub struct Violations {
     pub disallowed: u64,
 }
 
+/// Requests the referee could neither prove polite nor prove impolite, because the previous
+/// response's true end lies inside its observation window. Not counted as violations.
+#[derive(Debug, Default, Serialize)]
+pub struct Uncertain {
+    pub too_soon: u64,
+    pub retry_after: u64,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     pub requests: u64,
@@ -395,9 +407,15 @@ pub struct Report {
     /// Responses the client did not fully receive (disconnect or timeout).
     pub aborted: u64,
     pub hosts_contacted: u64,
+    /// Proven violations: impolite even if each previous response ended as early as possible.
     pub violations: Violations,
-    /// Smallest (gap - required delay) seen on any host, in ms. Negative means too soon.
+    pub uncertain: Uncertain,
+    /// Smallest (gap - required delay) seen on any host, in ms, taking the latest possible end
+    /// of the previous response. Negative only means "not proven polite"; see `uncertain`.
     pub min_gap_slack_ms: Option<i64>,
+    /// Width of the window in which each response's end was located (polling resolution).
+    pub end_window_ms_max: f64,
+    pub end_window_ms_mean: f64,
     /// The first violations, with enough context to reproduce them.
     pub details: Vec<String>,
 }
@@ -417,6 +435,11 @@ pub struct Referee {
     retry_after: AtomicU64,
     before_robots: AtomicU64,
     disallowed: AtomicU64,
+    uncertain_too_soon: AtomicU64,
+    uncertain_retry_after: AtomicU64,
+    end_window_us_max: AtomicU64,
+    end_window_us_sum: AtomicU64,
+    ends: AtomicU64,
 }
 
 /// Slack for clock granularity when judging gaps.
@@ -440,6 +463,11 @@ impl Referee {
             retry_after: AtomicU64::new(0),
             before_robots: AtomicU64::new(0),
             disallowed: AtomicU64::new(0),
+            uncertain_too_soon: AtomicU64::new(0),
+            uncertain_retry_after: AtomicU64::new(0),
+            end_window_us_max: AtomicU64::new(0),
+            end_window_us_sum: AtomicU64::new(0),
+            ends: AtomicU64::new(0),
         }
     }
 
@@ -459,30 +487,39 @@ impl Referee {
                 w.last_path
             ));
         }
-        if let Some(end) = w.last_end {
-            let gap = now.saturating_duration_since(end);
+        if let Some((earliest, latest)) = w.last_end {
+            // Longest and shortest possible gap since the previous response ended.
+            let gap_max = now.saturating_duration_since(earliest);
+            let gap_min = now.saturating_duration_since(latest);
             // Crawl-delay only binds once the crawler could have read it.
             let required = if w.rules_served {
                 spec.required_gap(h)
             } else {
                 Duration::from_millis(spec.delay_ms)
             };
-            let slack = gap.as_millis() as i64 - required.as_millis() as i64;
+            let slack = gap_min.as_millis() as i64 - required.as_millis() as i64;
             w.min_gap_slack_ms = Some(w.min_gap_slack_ms.map_or(slack, |m| m.min(slack)));
-            if gap + TOLERANCE < required {
+            if gap_max + TOLERANCE < required {
                 self.too_soon.fetch_add(1, Ordering::Relaxed);
                 self.note(format!(
-                    "too_soon host={h} path={path} gap_ms={} required_ms={} previous={} status={}",
-                    gap.as_millis(),
+                    "too_soon host={h} path={path} gap_ms={:.1}..{:.1} required_ms={} previous={} status={}",
+                    gap_min.as_secs_f64() * 1e3,
+                    gap_max.as_secs_f64() * 1e3,
                     required.as_millis(),
                     w.last_path,
                     w.last_status
                 ));
+            } else if gap_min < required {
+                self.uncertain_too_soon.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if w.not_before.is_some_and(|nb| now + TOLERANCE < nb) {
-            self.retry_after.fetch_add(1, Ordering::Relaxed);
-            self.note(format!("retry_after host={h} path={path}"));
+        if let Some((nb_earliest, nb_latest)) = w.not_before {
+            if now + TOLERANCE < nb_earliest {
+                self.retry_after.fetch_add(1, Ordering::Relaxed);
+                self.note(format!("retry_after host={h} path={path}"));
+            } else if now < nb_latest {
+                self.uncertain_retry_after.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if path == "/robots.txt" {
             self.robots_requests.fetch_add(1, Ordering::Relaxed);
@@ -504,21 +541,31 @@ impl Referee {
         this
     }
 
-    /// Records the end of a response for `path`: when the client acknowledged its last byte
-    /// (`delivered`), or when delivery failed. The gap and Retry-After clocks start here.
-    /// A robots.txt that was not delivered leaves the host without usable rules.
+    /// Records the end of a response for `path`. Its true end (the client acknowledging the
+    /// last byte, or delivery failing) lies in [`earliest`, `latest`]. The gap and
+    /// Retry-After clocks start there. A robots.txt that was not delivered leaves the host
+    /// without usable rules.
+    #[allow(clippy::too_many_arguments)]
     pub fn end(
         &self,
         h: u32,
         path: &str,
         response: &Response,
         bytes: usize,
-        now: Instant,
+        earliest: Instant,
+        latest: Instant,
         delivered: bool,
     ) {
+        let latest = latest.max(earliest);
+        let window_us = (latest - earliest).as_micros() as u64;
+        self.end_window_us_max
+            .fetch_max(window_us, Ordering::Relaxed);
+        self.end_window_us_sum
+            .fetch_add(window_us, Ordering::Relaxed);
+        self.ends.fetch_add(1, Ordering::Relaxed);
         let mut w = self.hosts[h as usize].lock().unwrap();
         w.in_flight -= 1;
-        w.last_end = Some(now);
+        w.last_end = Some((earliest, latest));
         w.last_status = response.status;
         if !delivered {
             self.aborted.fetch_add(1, Ordering::Relaxed);
@@ -540,7 +587,8 @@ impl Referee {
                 .find(|(k, _)| *k == "retry-after")
                 .and_then(|(_, v)| v.parse().ok());
             if let Some(secs) = secs {
-                w.not_before = Some(now + Duration::from_secs(secs));
+                let wait = Duration::from_secs(secs);
+                w.not_before = Some((earliest + wait, latest + wait));
             }
         }
         if response.status == 200 {
@@ -576,6 +624,14 @@ impl Referee {
             bytes_sent: get(&self.bytes),
             unknown_host: get(&self.unknown),
             aborted: get(&self.aborted),
+            uncertain: Uncertain {
+                too_soon: get(&self.uncertain_too_soon),
+                retry_after: get(&self.uncertain_retry_after),
+            },
+            end_window_ms_max: get(&self.end_window_us_max) as f64 / 1e3,
+            end_window_ms_mean: get(&self.end_window_us_sum) as f64
+                / 1e3
+                / get(&self.ends).max(1) as f64,
             hosts_contacted: contacted,
             violations: Violations {
                 concurrent: get(&self.concurrent),
@@ -603,6 +659,8 @@ pub mod server {
 
     use super::{Body, Referee, WebSpec, filler, parse_host};
 
+    /// Immediate re-checks of the send queue before polling on a timer.
+    const SPIN_CHECKS: u32 = 64;
     /// How long a response may take to be acknowledged before it counts as failed.
     const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
     const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -666,16 +724,31 @@ pub mod server {
         (rc == 0).then_some(n)
     }
 
-    /// Waits until every byte written to `fd` has been acknowledged. False on timeout or error.
-    async fn delivered(fd: RawFd) -> bool {
-        let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    /// Waits until every byte written to `fd` has been acknowledged, starting at `written`
+    /// (when the last byte was handed to the kernel). Returns whether delivery succeeded and
+    /// the window [earliest, latest] that contains the moment it happened (or failed): after
+    /// the last observation of unacknowledged bytes, no later than the first empty one.
+    async fn delivered(fd: RawFd, written: Instant) -> (bool, Instant, Instant) {
+        let deadline = written + DELIVERY_TIMEOUT;
+        let mut earliest = written;
+        let mut spins = 0;
         loop {
+            let observed = Instant::now();
             match unacked_bytes(fd) {
-                Some(0) => return true,
-                Some(_) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(1)).await
+                Some(0) => return (true, earliest, observed),
+                Some(_) if observed < deadline => {
+                    earliest = observed;
+                    // Most responses are acknowledged within microseconds on loopback: check
+                    // again right away a few times before falling back to a 1 ms timer, so the
+                    // window that brackets the true end stays narrow.
+                    if spins < SPIN_CHECKS {
+                        spins += 1;
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                 }
-                _ => return false,
+                _ => return (false, earliest, observed),
             }
         }
     }
@@ -815,9 +888,14 @@ pub mod server {
                 body,
                 head.close,
             );
-            let ok = write_all(&mut write_half, &bytes).await && delivered(fd).await;
+            let (ok, earliest, latest) = if write_all(&mut write_half, &bytes).await {
+                delivered(fd, Instant::now()).await
+            } else {
+                let now = Instant::now();
+                (false, now, now)
+            };
             sim.referee
-                .end(h, &head.path, &response, body.len(), Instant::now(), ok);
+                .end(h, &head.path, &response, body.len(), earliest, latest, ok);
             if !ok || head.close {
                 return;
             }
@@ -929,10 +1007,18 @@ mod tests {
         let t0 = Instant::now();
         r.start(&s, 0, "/p/1", t0); // before robots
         r.start(&s, 0, "/robots.txt", t0); // concurrent
-        r.end(0, "/p/1", &ok, 0, t0, true);
-        r.end(0, "/robots.txt", &ok, 0, t0, true);
+        r.end(0, "/p/1", &ok, 0, t0, t0, true);
+        r.end(0, "/robots.txt", &ok, 0, t0, t0, true);
         r.start(&s, 0, "/p/2", t0 + Duration::from_millis(50)); // too soon
-        r.end(0, "/p/2", &ok, 0, t0 + Duration::from_millis(50), true);
+        r.end(
+            0,
+            "/p/2",
+            &ok,
+            0,
+            t0 + Duration::from_millis(50),
+            t0 + Duration::from_millis(50),
+            true,
+        );
         r.start(&s, 0, "/p/3", t0 + Duration::from_millis(200)); // fine
         let v = r.report().violations;
         assert_eq!(
@@ -964,7 +1050,7 @@ mod tests {
         };
         let t0 = Instant::now();
         r.start(&s, h, "/robots.txt", t0);
-        r.end(h, "/robots.txt", &failed, 0, t0, true);
+        r.end(h, "/robots.txt", &failed, 0, t0, t0, true);
         // Only the base delay applies: the crawler has not seen the Crawl-delay yet.
         r.start(&s, h, "/robots.txt", t0 + Duration::from_millis(150));
         r.end(
@@ -972,6 +1058,7 @@ mod tests {
             "/robots.txt",
             &ok,
             0,
+            t0 + Duration::from_millis(150),
             t0 + Duration::from_millis(150),
             true,
         );
@@ -1155,6 +1242,34 @@ mod tests {
         assert_eq!(r.status_200, 4);
     }
 
+    /// A request that is too soon only if the previous response ended late in its window is
+    /// uncertain, not a violation; one that is too soon even from the earliest end is proven.
+    #[test]
+    fn end_windows_separate_proven_from_uncertain() {
+        let s = WebSpec {
+            delay_ms: 100,
+            ..spec()
+        };
+        let r = Referee::new(1);
+        let ok = Response {
+            status: 200,
+            headers: vec![],
+            body: Body::Empty,
+            latency: Duration::ZERO,
+        };
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        r.start(&s, 0, "/robots.txt", t0);
+        r.end(0, "/robots.txt", &ok, 0, t0, t0 + ms(5), true);
+        r.start(&s, 0, "/", t0 + ms(103)); // 98..103 ms after the end: uncertain
+        r.end(0, "/", &ok, 0, t0 + ms(103), t0 + ms(103), true);
+        r.start(&s, 0, "/p/0", t0 + ms(190)); // 87 ms: proven too soon
+        let rep = r.report();
+        assert_eq!(rep.violations.too_soon, 1, "{:?}", rep.details);
+        assert_eq!(rep.uncertain.too_soon, 1);
+        assert!((rep.end_window_ms_max - 5.0).abs() < 0.01);
+    }
+
     #[test]
     fn a_page_after_a_failed_robots_txt_is_a_violation() {
         let s = WebSpec {
@@ -1170,7 +1285,7 @@ mod tests {
         };
         let t0 = Instant::now();
         r.start(&s, 0, "/robots.txt", t0);
-        r.end(0, "/robots.txt", &failed, 0, t0, true);
+        r.end(0, "/robots.txt", &failed, 0, t0, t0, true);
         r.start(&s, 0, "/", t0 + Duration::from_millis(500));
         assert_eq!(r.report().violations.before_robots, 1);
     }
