@@ -14,16 +14,20 @@ On a simulated web of 10,000 hosts with injected latency, errors, 429s, redirect
 robots.txt rules, one rayap process on a laptop (i7-12650H, WSL2) fetched, parsed and
 committed to SQLite at:
 
-- **about 3,900 pages/s in the steady window** (median 3,940 of 3 runs; windows of
-  63–99 s);
-- **about 1,740 pages/s over the whole crawl** (227 s), including the tail of slow and
-  Crawl-delayed hosts;
-- with a 2 s per-host delay and **zero politeness violations** counted by an independent
+- **about 4,070 pages/s in the steady window** (median of 3 runs, each 91–94 s);
+- **about 1,750 pages/s over the whole crawl** (about 226 s), including the tail of slow
+  and Crawl-delayed hosts;
+- with a 2 s per-host delay and **zero politeness violations** proven by an independent
   referee.
+
+The referee judges each response's end at the TCP level, from when the client
+acknowledges the last byte. It catches a crawler set 10 ms too fast 80,004 times in the
+same crawl.
 
 100 million pages a day is 1,157 pages/s. This is a loopback simulation, not the public
 internet. [bench/README.md](bench/README.md) has:
 - the setup and every raw result with its command;
+- negative controls;
 - a before/after optimisation;
 - a scaling table showing where one coordinator stops scaling (about 20,000 hosts);
 - the limits.
