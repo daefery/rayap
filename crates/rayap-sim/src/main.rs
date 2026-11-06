@@ -1,12 +1,13 @@
 //! `rayap-sim`: serve the simulated web. Prints `listening <addr>` when ready.
-//! `GET /__sim/report` on any non-`.sim` host returns the referee's report as JSON.
+//! `GET /__sim/report` (any non-`.sim` Host) returns the referee's report as JSON, and
+//! `GET /__sim/spec` the resolved simulation settings.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
 use rayap_sim::WebSpec;
-use rayap_sim::server::{Sim, router};
+use rayap_sim::server::{Sim, serve};
 
 #[derive(Parser)]
 #[command(about = "Serve a simulated web for crawler benchmarks")]
@@ -21,10 +22,9 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let app = router(Arc::new(Sim::new(cli.spec)));
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
         .expect("bind");
     println!("listening {}", listener.local_addr().expect("addr"));
-    axum::serve(listener, app).await.expect("serve");
+    serve(listener, Arc::new(Sim::new(cli.spec))).await;
 }

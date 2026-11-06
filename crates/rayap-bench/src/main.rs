@@ -349,7 +349,9 @@ async fn e2e(
     // so throughput, CPU and busy fraction can be reported over the same window.
     let pages = Arc::new(AtomicU64::new(0));
     let busy = Arc::new(AtomicU64::new(0));
-    let samples = Arc::new(std::sync::Mutex::new(Vec::<(u64, f64, u64)>::new()));
+    // (seconds since start, pages, crawler CPU seconds, coordinator busy microseconds)
+    let samples = Arc::new(std::sync::Mutex::new(Vec::<(f64, u64, f64, u64)>::new()));
+    let origin = tokio::time::Instant::now();
     let sampler = {
         let pages = Arc::clone(&pages);
         let busy = Arc::clone(&busy);
@@ -359,8 +361,10 @@ async fn e2e(
             tick.tick().await;
             loop {
                 tick.tick().await;
+                let t = origin.elapsed().as_secs_f64();
                 let cpu = self_usage().0;
                 samples.lock().unwrap().push((
+                    t,
                     pages.load(Ordering::Relaxed),
                     cpu,
                     busy.load(Ordering::Relaxed),
@@ -370,7 +374,7 @@ async fn e2e(
     };
 
     let (cpu0, _) = self_usage();
-    samples.lock().unwrap().push((0, cpu0, 0));
+    samples.lock().unwrap().push((0.0, 0, cpu0, 0));
     let started = Instant::now();
     let mut kinds = std::collections::BTreeMap::<&'static str, u64>::new();
     let options = Options {
@@ -394,6 +398,13 @@ async fn e2e(
     let elapsed = started.elapsed().as_secs_f64();
     let (cpu1, rss) = self_usage();
     sampler.abort();
+    // Final sample at the exact end, so the whole-run window includes the last partial second.
+    samples.lock().unwrap().push((
+        origin.elapsed().as_secs_f64(),
+        pages.load(Ordering::Relaxed),
+        cpu1,
+        busy.load(Ordering::Relaxed),
+    ));
 
     if let (Some(guard), Some(path)) = (guard, &flamegraph)
         && let Ok(report) = guard.report().build()
@@ -416,7 +427,10 @@ async fn e2e(
 
     let fetched = pages.load(Ordering::Relaxed);
     let samples = samples.lock().unwrap().clone();
-    let per_sec: Vec<u64> = samples.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    // Per-second throughput from the regular samples (the final partial interval is excluded
+    // here, and included in the whole-run window below).
+    let regular = &samples[..samples.len() - 1];
+    let per_sec: Vec<u64> = regular.windows(2).map(|w| w[1].1 - w[0].1).collect();
     // Steady window: the longest run of consecutive seconds at >= 50% of the peak rate.
     // Before it every host is fetching robots.txt and its root page; after it only hosts
     // with long Crawl-delays or pending retries remain.
@@ -443,18 +457,20 @@ async fn e2e(
             .copied()
             .unwrap_or(0)
     };
+    // Rates over [samples[a], samples[b]] using the samples' own timestamps. The coordinator
+    // adds busy time after each piece of work, so a window edge can be off by up to one piece
+    // of work: the busy fraction is an estimate and can exceed 1.0 slightly.
     let window = |a: usize, b: usize| {
-        // samples[i] is the state after i seconds; seconds a..b span samples[a]..samples[b].
         let (s0, s1) = (samples[a], samples[b]);
-        let secs = (b - a) as f64;
+        let secs = (s1.0 - s0.0).max(1e-9);
         json!({
-            "from_second": a,
-            "to_second": b,
-            "seconds": b - a,
-            "pages": s1.0 - s0.0,
-            "pages_per_second": round((s1.0 - s0.0) as f64 / secs),
-            "crawler_cpu_cores": round((s1.1 - s0.1) / secs),
-            "coordinator_busy_fraction": round((s1.2 - s0.2) as f64 / 1e6 / secs),
+            "from_seconds": round(s0.0),
+            "to_seconds": round(s1.0),
+            "seconds": round(secs),
+            "pages": s1.1 - s0.1,
+            "pages_per_second": round((s1.1 - s0.1) as f64 / secs),
+            "crawler_cpu_cores": round((s1.2 - s0.2) / secs),
+            "coordinator_busy_fraction_estimate": round((s1.3 - s0.3) as f64 / 1e6 / secs),
         })
     };
     let steady_window = if len > 0 {
@@ -469,8 +485,8 @@ async fn e2e(
     };
     let t90 = samples
         .iter()
-        .position(|v| v.0 * 10 >= fetched * 9)
-        .map_or(elapsed, |i| i as f64);
+        .find(|v| v.1 * 10 >= fetched * 9)
+        .map_or(elapsed, |v| round(v.0));
     let sim_resolved: Vec<String> = args.clone();
 
     let report = json!({
@@ -504,7 +520,7 @@ async fn e2e(
         "crawler_peak_rss_mib": round(rss),
         "simulator_cpu_seconds": sim_cpu.map(round),
         "simulator_cpu_cores_avg": sim_cpu.map(|c| round(c / elapsed)),
-        "coordinator_busy_fraction": stats.as_ref().map(|s| round(s.coordinator_busy.as_secs_f64() / elapsed)),
+        "coordinator_busy_fraction_whole_run": stats.as_ref().map(|s| round(s.coordinator_busy.as_secs_f64() / elapsed)),
         "referee": referee,
         "stats": stats.map(|s| json!({ "requests": s.requests, "events": s.events, "bytes": s.bytes })),
     });

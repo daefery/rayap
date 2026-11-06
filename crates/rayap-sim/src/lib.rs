@@ -74,6 +74,10 @@ pub struct WebSpec {
     pub delay_ms: u64,
     #[arg(long, default_value_t = 1)]
     pub seed: u64,
+    /// Comment lines appended to every robots.txt, in KiB (tests use it to make robots.txt
+    /// too large to deliver while the client is not reading).
+    #[arg(long, default_value_t = 0)]
+    pub robots_padding_kib: u32,
 }
 
 impl WebSpec {
@@ -221,6 +225,9 @@ impl WebSpec {
             }
             if let Some(d) = facts.crawl_delay {
                 txt.push_str(&format!("Crawl-delay: {d}\n"));
+            }
+            while txt.len() < self.robots_padding_kib as usize * 1024 {
+                txt.push_str("# padding padding padding padding padding padding padding\n");
             }
             return Response {
                 status: 200,
@@ -385,6 +392,8 @@ pub struct Report {
     pub status_200: u64,
     pub bytes_sent: u64,
     pub unknown_host: u64,
+    /// Responses the client did not fully receive (disconnect or timeout).
+    pub aborted: u64,
     pub hosts_contacted: u64,
     pub violations: Violations,
     /// Smallest (gap - required delay) seen on any host, in ms. Negative means too soon.
@@ -402,6 +411,7 @@ pub struct Referee {
     ok: AtomicU64,
     bytes: AtomicU64,
     unknown: AtomicU64,
+    aborted: AtomicU64,
     concurrent: AtomicU64,
     too_soon: AtomicU64,
     retry_after: AtomicU64,
@@ -424,6 +434,7 @@ impl Referee {
             ok: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             unknown: AtomicU64::new(0),
+            aborted: AtomicU64::new(0),
             concurrent: AtomicU64::new(0),
             too_soon: AtomicU64::new(0),
             retry_after: AtomicU64::new(0),
@@ -493,20 +504,32 @@ impl Referee {
         this
     }
 
-    /// Records the end of a response for `path`. Call it only after the last byte of the
-    /// body has been written to the connection: the gap and Retry-After clocks start here,
-    /// so ending early would make the referee more lenient.
-    pub fn end(&self, h: u32, path: &str, response: &Response, bytes: usize, now: Instant) {
+    /// Records the end of a response for `path`: when the client acknowledged its last byte
+    /// (`delivered`), or when delivery failed. The gap and Retry-After clocks start here.
+    /// A robots.txt that was not delivered leaves the host without usable rules.
+    pub fn end(
+        &self,
+        h: u32,
+        path: &str,
+        response: &Response,
+        bytes: usize,
+        now: Instant,
+        delivered: bool,
+    ) {
         let mut w = self.hosts[h as usize].lock().unwrap();
         w.in_flight -= 1;
         w.last_end = Some(now);
         w.last_status = response.status;
+        if !delivered {
+            self.aborted.fetch_add(1, Ordering::Relaxed);
+        }
         if path == "/robots.txt" {
             w.robots = match response.status {
+                _ if !delivered => RobotsSeen::Unreachable,
                 200..=299 | 400..=428 | 430..=499 => RobotsSeen::Usable,
                 _ => RobotsSeen::Unreachable,
             };
-            if response.status == 200 {
+            if response.status == 200 && delivered {
                 w.rules_served = true;
             }
         }
@@ -552,6 +575,7 @@ impl Referee {
             status_200: get(&self.ok),
             bytes_sent: get(&self.bytes),
             unknown_host: get(&self.unknown),
+            aborted: get(&self.aborted),
             hosts_contacted: contacted,
             violations: Violations {
                 concurrent: get(&self.concurrent),
@@ -566,170 +590,244 @@ impl Referee {
     }
 }
 
-/// The simulated web as an HTTP service: answers for every host, asks the referee before
-/// each response, and reports the end of each response only after its body is sent.
+/// The simulated web over plain HTTP/1.1 on TCP, written directly on sockets so the referee
+/// sees transport events: a response ends when the client's TCP stack has acknowledged its
+/// last byte (the kernel send queue is empty), or when delivery fails.
 pub mod server {
-    use std::pin::Pin;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::sync::Arc;
-    use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
 
-    use axum::Router;
-    use axum::body::Body as AxumBody;
-    use axum::extract::{Request, State};
-    use axum::http::{HeaderValue, StatusCode, header};
-    use axum::response::{IntoResponse, Response as AxumResponse};
-    use bytes::Bytes;
-    use futures_util::Stream;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
 
-    use super::{Body, Referee, Response, WebSpec, filler, parse_host};
+    use super::{Body, Referee, WebSpec, filler, parse_host};
+
+    /// How long a response may take to be acknowledged before it counts as failed.
+    const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+    const MAX_HEAD_BYTES: usize = 16 * 1024;
 
     pub struct Sim {
         pub spec: WebSpec,
         pub referee: Referee,
         filler: String,
-        /// Bytes per body chunk and the pause after each (to model slow transfers in tests).
-        chunk: usize,
-        chunk_pause: Duration,
+        /// SO_SNDBUF for accepted sockets (tests use a small one to force backpressure).
+        send_buffer: Option<usize>,
     }
 
     impl Sim {
         pub fn new(spec: WebSpec) -> Self {
-            Self::with_chunks(spec, 64 * 1024, Duration::ZERO)
+            Self::with_send_buffer(spec, None)
         }
 
-        pub fn with_chunks(spec: WebSpec, chunk: usize, chunk_pause: Duration) -> Self {
+        pub fn with_send_buffer(spec: WebSpec, send_buffer: Option<usize>) -> Self {
             Self {
                 referee: Referee::new(spec.hosts),
                 filler: filler(spec.body_kib as usize * 1024 + 1024),
                 spec,
-                chunk: chunk.max(1),
-                chunk_pause,
+                send_buffer,
             }
         }
     }
 
-    pub fn router(sim: Arc<Sim>) -> Router {
-        Router::new().fallback(handle).with_state(sim)
-    }
-
-    /// Streams `bytes` and tells the referee the response ended once the last chunk has been
-    /// handed to the connection, or when the client goes away (the stream is dropped).
-    struct Tracked {
-        sim: Arc<Sim>,
-        host: u32,
-        path: String,
-        response: Response,
-        bytes: Bytes,
-        sent: usize,
-        pause: Option<Pin<Box<tokio::time::Sleep>>>,
-        ended: bool,
-    }
-
-    impl Tracked {
-        fn finish(&mut self) {
-            if !self.ended {
-                self.ended = true;
-                self.sim.referee.end(
-                    self.host,
-                    &self.path,
-                    &self.response,
-                    self.sent,
-                    Instant::now(),
-                );
+    pub async fn serve(listener: TcpListener, sim: Arc<Sim>) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            let _ = stream.set_nodelay(true);
+            if let Some(size) = sim.send_buffer {
+                set_send_buffer(stream.as_raw_fd(), size);
             }
+            tokio::spawn(connection(stream, Arc::clone(&sim)));
         }
     }
 
-    impl Stream for Tracked {
-        type Item = Result<Bytes, std::io::Error>;
+    fn set_send_buffer(fd: RawFd, size: usize) {
+        let size = size as libc::c_int;
+        // SAFETY: fd is an open socket owned by the caller; the option value is a c_int.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
 
-        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            if let Some(pause) = self.pause.as_mut() {
-                if pause.as_mut().poll(cx).is_pending() {
-                    return Poll::Pending;
+    /// Bytes written but not yet acknowledged by the peer (Linux SIOCOUTQ / TIOCOUTQ).
+    fn unacked_bytes(fd: RawFd) -> Option<i32> {
+        let mut n: libc::c_int = 0;
+        // SAFETY: fd is an open socket; TIOCOUTQ writes one c_int.
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut n) };
+        (rc == 0).then_some(n)
+    }
+
+    /// Waits until every byte written to `fd` has been acknowledged. False on timeout or error.
+    async fn delivered(fd: RawFd) -> bool {
+        let deadline = Instant::now() + DELIVERY_TIMEOUT;
+        loop {
+            match unacked_bytes(fd) {
+                Some(0) => return true,
+                Some(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(1)).await
                 }
-                self.pause = None;
+                _ => return false,
             }
-            if self.sent >= self.bytes.len() {
-                // hyper polls once more after the last chunk was written: the body is out.
-                self.finish();
-                return Poll::Ready(None);
-            }
-            let end = (self.sent + self.sim.chunk).min(self.bytes.len());
-            let chunk = self.bytes.slice(self.sent..end);
-            self.sent = end;
-            if !self.sim.chunk_pause.is_zero() {
-                self.pause = Some(Box::pin(tokio::time::sleep(self.sim.chunk_pause)));
-            }
-            Poll::Ready(Some(Ok(chunk)))
         }
     }
 
-    impl Drop for Tracked {
-        fn drop(&mut self) {
-            self.finish();
+    struct Head {
+        path: String,
+        host: String,
+        close: bool,
+        get: bool,
+    }
+
+    /// Reads one request head. None when the connection closes or the request is malformed.
+    async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Option<Head> {
+        let mut line = String::new();
+        let mut total = 0;
+        let mut head: Option<Head> = None;
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            total += n;
+            if total > MAX_HEAD_BYTES {
+                return None;
+            }
+            let l = line.trim_end_matches(['\r', '\n']);
+            match head.as_mut() {
+                None => {
+                    let mut parts = l.split(' ');
+                    let method = parts.next()?;
+                    let path = parts.next()?.to_string();
+                    let version = parts.next().unwrap_or("HTTP/1.1");
+                    head = Some(Head {
+                        path,
+                        host: String::new(),
+                        close: version == "HTTP/1.0",
+                        get: method == "GET",
+                    });
+                }
+                Some(h) => {
+                    if l.is_empty() {
+                        return head;
+                    }
+                    if let Some((k, v)) = l.split_once(':') {
+                        let v = v.trim();
+                        if k.eq_ignore_ascii_case("host") {
+                            h.host = v.to_string();
+                        } else if k.eq_ignore_ascii_case("connection") {
+                            h.close = v.eq_ignore_ascii_case("close");
+                        }
+                    }
+                }
+            }
         }
     }
 
-    async fn handle(State(sim): State<Arc<Sim>>, request: Request) -> AxumResponse {
-        let host = request
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let path = request
-            .uri()
-            .path_and_query()
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "/".into());
-        let Some(h) = parse_host(&host).filter(|h| *h < sim.spec.hosts) else {
-            if path == "/__sim/report" {
-                return axum::Json(sim.referee.report()).into_response();
-            }
-            if path == "/__sim/spec" {
-                return axum::Json(&sim.spec).into_response();
-            }
-            sim.referee.unknown_host();
-            return StatusCode::MISDIRECTED_REQUEST.into_response();
-        };
+    fn reason(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            301 => "Moved Permanently",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            421 => "Misdirected Request",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Status",
+        }
+    }
 
-        let attempt = sim.referee.start(&sim.spec, h, &path, Instant::now());
-        let response = sim.spec.respond(h, &path, attempt, &sim.filler);
-        tokio::time::sleep(response.latency).await;
+    fn encode(
+        status: u16,
+        content_type: &str,
+        extra: &[(&str, String)],
+        body: &[u8],
+        close: bool,
+    ) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n",
+            reason(status),
+            body.len()
+        );
+        for (k, v) in extra {
+            out.push_str(&format!("{k}: {v}\r\n"));
+        }
+        if close {
+            out.push_str("connection: close\r\n");
+        }
+        out.push_str("\r\n");
+        let mut bytes = out.into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
 
-        let (content_type, bytes) = match &response.body {
-            Body::Html(s) => ("text/html; charset=utf-8", Bytes::from(s.clone())),
-            Body::Text(s) => ("text/plain", Bytes::from(s.clone())),
-            Body::Empty => ("text/plain", Bytes::new()),
-        };
-        let status =
-            StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let headers = response.headers.clone();
-        let len = bytes.len();
-        let body = Tracked {
-            sim: Arc::clone(&sim),
-            host: h,
-            path,
-            response,
-            bytes,
-            sent: 0,
-            pause: None,
-            ended: false,
-        };
-        let mut out = AxumResponse::new(AxumBody::from_stream(body));
-        *out.status_mut() = status;
-        out.headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-        out.headers_mut()
-            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-        for (name, value) in headers {
-            if let Ok(v) = HeaderValue::from_str(&value) {
-                out.headers_mut().insert(name, v);
+    async fn connection(stream: TcpStream, sim: Arc<Sim>) {
+        let fd = stream.as_raw_fd();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        while let Some(head) = read_head(&mut reader).await {
+            let simulated = parse_host(&head.host).filter(|h| *h < sim.spec.hosts);
+            let Some(h) = simulated.filter(|_| head.get) else {
+                // Control endpoints and stray requests: not refereed.
+                let (status, body) = match (head.get, head.path.as_str()) {
+                    (true, "/__sim/report") => (
+                        200,
+                        serde_json::to_vec(&sim.referee.report()).unwrap_or_default(),
+                    ),
+                    (true, "/__sim/spec") => {
+                        (200, serde_json::to_vec(&sim.spec).unwrap_or_default())
+                    }
+                    (false, _) => (405, Vec::new()),
+                    _ => {
+                        sim.referee.unknown_host();
+                        (421, Vec::new())
+                    }
+                };
+                let bytes = encode(status, "application/json", &[], &body, head.close);
+                if write_half.write_all(&bytes).await.is_err() || head.close {
+                    return;
+                }
+                continue;
+            };
+
+            let attempt = sim.referee.start(&sim.spec, h, &head.path, Instant::now());
+            let response = sim.spec.respond(h, &head.path, attempt, &sim.filler);
+            tokio::time::sleep(response.latency).await;
+            let (content_type, body): (&str, &[u8]) = match &response.body {
+                Body::Html(s) => ("text/html; charset=utf-8", s.as_bytes()),
+                Body::Text(s) => ("text/plain", s.as_bytes()),
+                Body::Empty => ("text/plain", &[]),
+            };
+            let bytes = encode(
+                response.status,
+                content_type,
+                &response.headers,
+                body,
+                head.close,
+            );
+            let ok = write_all(&mut write_half, &bytes).await && delivered(fd).await;
+            sim.referee
+                .end(h, &head.path, &response, body.len(), Instant::now(), ok);
+            if !ok || head.close {
+                return;
             }
         }
-        out
+    }
+
+    async fn write_all(w: &mut tokio::net::tcp::OwnedWriteHalf, bytes: &[u8]) -> bool {
+        tokio::time::timeout(DELIVERY_TIMEOUT, w.write_all(bytes))
+            .await
+            .is_ok_and(|r| r.is_ok())
     }
 }
 
@@ -831,10 +929,10 @@ mod tests {
         let t0 = Instant::now();
         r.start(&s, 0, "/p/1", t0); // before robots
         r.start(&s, 0, "/robots.txt", t0); // concurrent
-        r.end(0, "/p/1", &ok, 0, t0);
-        r.end(0, "/robots.txt", &ok, 0, t0);
+        r.end(0, "/p/1", &ok, 0, t0, true);
+        r.end(0, "/robots.txt", &ok, 0, t0, true);
         r.start(&s, 0, "/p/2", t0 + Duration::from_millis(50)); // too soon
-        r.end(0, "/p/2", &ok, 0, t0 + Duration::from_millis(50));
+        r.end(0, "/p/2", &ok, 0, t0 + Duration::from_millis(50), true);
         r.start(&s, 0, "/p/3", t0 + Duration::from_millis(200)); // fine
         let v = r.report().violations;
         assert_eq!(
@@ -866,25 +964,28 @@ mod tests {
         };
         let t0 = Instant::now();
         r.start(&s, h, "/robots.txt", t0);
-        r.end(h, "/robots.txt", &failed, 0, t0);
+        r.end(h, "/robots.txt", &failed, 0, t0, true);
         // Only the base delay applies: the crawler has not seen the Crawl-delay yet.
         r.start(&s, h, "/robots.txt", t0 + Duration::from_millis(150));
-        r.end(h, "/robots.txt", &ok, 0, t0 + Duration::from_millis(150));
+        r.end(
+            h,
+            "/robots.txt",
+            &ok,
+            0,
+            t0 + Duration::from_millis(150),
+            true,
+        );
         assert_eq!(r.report().violations.too_soon, 0);
         // Now the Crawl-delay applies.
         r.start(&s, h, "/", t0 + Duration::from_millis(300));
         assert_eq!(r.report().violations.too_soon, 1);
     }
 
-    /// Negative control: a client that ignores the delay while bodies are still streaming must
-    /// be caught. With the end recorded before the body was sent, this request would pass.
-    #[tokio::test]
-    async fn referee_measures_gaps_from_the_end_of_the_body() {
-        use std::sync::Arc;
-        let s = WebSpec {
+    fn quiet_spec(delay_ms: u64, body_kib: u32) -> WebSpec {
+        WebSpec {
             hosts: 1,
             pages: 1,
-            body_kib: 64,
+            body_kib,
             latency_median_ms: 1,
             latency_sigma: 0.0,
             slow_hosts_pct: 0.0,
@@ -892,55 +993,166 @@ mod tests {
             throttle_pct: 0.0,
             gone_pct: 0.0,
             redirect_pct: 0.0,
-            robots_missing_pct: 100.0,
+            robots_missing_pct: 0.0,
             robots_flaky_pct: 0.0,
-            delay_ms: 300,
+            disallow_hosts_pct: 0.0,
+            crawl_delay_hosts_pct: 0.0,
+            delay_ms,
             ..spec()
-        };
-        // 64 KiB in 8 KiB chunks, 50 ms apart: the body takes about 400 ms to send.
-        let sim = Arc::new(server::Sim::with_chunks(
-            s,
-            8 * 1024,
-            Duration::from_millis(50),
-        ));
+        }
+    }
+
+    async fn start(sim: std::sync::Arc<server::Sim>) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = server::router(Arc::clone(&sim));
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::spawn(server::serve(listener, sim));
+        addr
+    }
 
-        let get = |path: &'static str| async move {
-            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let req =
-                format!("GET {path} HTTP/1.1\r\nHost: h00000.sim\r\nConnection: close\r\n\r\n");
-            stream.write_all(req.as_bytes()).await.unwrap();
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.unwrap();
-        };
-        get("/robots.txt").await;
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        get("/").await; // body streams for ~400 ms
-        // Polite: wait the full delay after the body finished.
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        get("/p/0").await;
-        assert_eq!(
-            sim.referee.report().violations.too_soon,
-            0,
-            "{:?}",
-            sim.referee.report().details
-        );
+    /// Sends a GET and returns the connected socket without reading the response.
+    async fn send(
+        addr: std::net::SocketAddr,
+        path: &str,
+        recv_buffer: Option<usize>,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        if let Some(size) = recv_buffer {
+            socket.set_recv_buffer_size(size as u32).unwrap();
+        }
+        let mut stream = socket.connect(addr).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: h00000.sim\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream
+    }
 
-        // Impolite: request again 150 ms after a slow body ended (300 ms required).
+    async fn read_all(mut stream: tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        buf
+    }
+
+    /// Negative control for transport backpressure: the client stops reading a large body, so
+    /// the server's writes block. A second request on another connection while the first body
+    /// is undelivered must count as concurrent, and the gap after it must be measured from the
+    /// moment the body is finally acknowledged.
+    #[tokio::test]
+    async fn referee_waits_for_the_client_to_receive_the_body() {
+        use std::sync::Arc;
+        let sim = Arc::new(server::Sim::with_send_buffer(
+            quiet_spec(300, 512),
+            Some(4096),
+        ));
+        let addr = start(Arc::clone(&sim)).await;
+        read_all(send(addr, "/robots.txt", None).await).await;
         tokio::time::sleep(Duration::from_millis(350)).await;
-        get("/").await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        get("/p/0").await;
+
+        // 512 KiB body, small buffers, nobody reading: it cannot be delivered yet.
+        let stalled = send(addr, "/", Some(4096)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        read_all(send(addr, "/p/0", None).await).await;
         assert_eq!(
-            sim.referee.report().violations.too_soon,
+            sim.referee.report().violations.concurrent,
             1,
             "{:?}",
             sim.referee.report().details
         );
+
+        // Wait out the delay after the overlapping request, then drain the stalled body. Its
+        // response ends only when the last byte is acknowledged, so a request 100 ms after
+        // that is too soon (and would not be if the gap were measured from earlier).
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let _ = read_all(stalled).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        read_all(send(addr, "/p/0", None).await).await;
+        let r = sim.referee.report();
+        assert_eq!(r.violations.too_soon, 1, "{:?}", r.details);
+    }
+
+    /// The end of a response is the client's acknowledgement of the last byte, not the
+    /// server's last write. The client reads all but the final part of the body, pauses (the
+    /// server has finished writing, but the tail is still queued and unacknowledged), then
+    /// reads the rest and quickly sends another request. That request is too soon.
+    #[tokio::test]
+    async fn the_end_is_the_acknowledgement_not_the_last_write() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+        let sim = Arc::new(server::Sim::with_send_buffer(
+            quiet_spec(300, 512),
+            Some(4096),
+        ));
+        let addr = start(Arc::clone(&sim)).await;
+        read_all(send(addr, "/robots.txt", None).await).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        let mut slow = send(addr, "/", Some(4096)).await;
+        let total = 512 * 1024;
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 1024];
+        // Leave about 12 KiB unread: more than the client's receive buffer, less than the
+        // receive and send buffers together, so the server's writes are done but not all acked.
+        while got + 12 * 1024 < total {
+            got += slow.read(&mut buf).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = read_all(slow).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        read_all(send(addr, "/p/0", None).await).await;
+        let r = sim.referee.report();
+        assert_eq!(r.violations.too_soon, 1, "{:?}", r.details);
+    }
+
+    /// A robots.txt the client abandons halfway does not give it permission to fetch pages.
+    #[tokio::test]
+    async fn an_abandoned_robots_txt_is_not_usable() {
+        use std::sync::Arc;
+        // A robots.txt far larger than the socket buffers, so it cannot be delivered while the
+        // client is not reading.
+        let mut s = quiet_spec(100, 1);
+        s.disallow_hosts_pct = 100.0;
+        s.robots_padding_kib = 512;
+        let sim = Arc::new(server::Sim::with_send_buffer(s, Some(4096)));
+        let addr = start(Arc::clone(&sim)).await;
+        let abandoned = send(addr, "/robots.txt", Some(4096)).await;
+        // Let the server fill the buffers and block, then hang up without reading.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(abandoned);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        read_all(send(addr, "/", None).await).await;
+        let r = sim.referee.report();
+        assert_eq!(
+            r.aborted, 1,
+            "the robots.txt was not delivered: {:?}",
+            r.details
+        );
+        assert_eq!(r.violations.before_robots, 1, "{:?}", r.details);
+    }
+
+    /// The happy path: a polite client gets no violations and full bodies.
+    #[tokio::test]
+    async fn a_polite_client_has_no_violations() {
+        use std::sync::Arc;
+        let sim = Arc::new(server::Sim::new(quiet_spec(150, 30)));
+        let addr = start(Arc::clone(&sim)).await;
+        for path in ["/robots.txt", "/", "/p/0", "/p/0"] {
+            let body = read_all(send(addr, path, None).await).await;
+            assert!(body.starts_with(b"HTTP/1.1 200 OK"), "{path}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let r = sim.referee.report();
+        assert_eq!(
+            (
+                r.violations.concurrent,
+                r.violations.too_soon,
+                r.violations.before_robots,
+                r.aborted
+            ),
+            (0, 0, 0, 0),
+            "{:?}",
+            r.details
+        );
+        assert_eq!(r.status_200, 4);
     }
 
     #[test]
@@ -958,7 +1170,7 @@ mod tests {
         };
         let t0 = Instant::now();
         r.start(&s, 0, "/robots.txt", t0);
-        r.end(0, "/robots.txt", &failed, 0, t0);
+        r.end(0, "/robots.txt", &failed, 0, t0, true);
         r.start(&s, 0, "/", t0 + Duration::from_millis(500));
         assert_eq!(r.report().violations.before_robots, 1);
     }
