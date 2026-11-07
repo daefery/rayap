@@ -41,7 +41,7 @@ page per 5 days, 70% of pages static: changes caught per 1,000 fetches 137 → 2
 0.966), mean staleness 75 h → 28.5 h. The gain is 1.2x to 1.85x across the workloads tried,
 never an order of magnitude; the table and the reasons are in
 [bench/README.md](bench/README.md#revisit-scheduling-learned-change-rates-vs-uniform-polling-7-nov-2026).
-The planner is not yet wired into `rayap crawl`.
+`rayap crawl --budget N` uses it; see Revisits below.
 
 **Structured sources.** 118 public TikTok posts → 115 `post` and 4,072 `comment` records,
 three deleted or under-review posts reported as `gone` rather than stored as content, 0
@@ -135,13 +135,24 @@ max_comments = 60   # top-level comments to collect, in pages of 20
 A `post` record carries `author`, `text`, `hashtags`, `mentions`, `music`, `duration_s`,
 `created_at` and `stats` (plays, likes, comments, shares, saves); a `comment` record carries
 `post_id`, `comment_id`, `author`, `text`, `likes`, `replies`, `created_at`. The change
-fingerprint covers ids and text only, so a like count moving is not a change. Records are
-keyed by `(kind, key)` and replaced when fetched again.
+fingerprint covers ids and text only (comment pages as a set, since TikTok reorders them),
+so a like count moving or a reorder is not a change. Records are keyed by `(kind, key)` and
+replaced when fetched again.
 
-Measured 7 Nov 2026: 118 public posts, 2 s between requests, no login or cookies. See
-[bench/tiktok](bench/tiktok/README.md). TikTok's robots.txt allows `/@handle/video/` for
-rayap's user agent; its terms of service forbid automated collection, so keep volume low
-and use it only where you have the right to.
+**Revisits.** `rayap crawl --budget N` visits every page never fetched plus the N known
+pages most due by their learned change rate (`rayap rates` shows the rates). Comment pages
+are continuation pages: they are fetched again only when their post is new or changed, or
+when the post's comment count moved. So an unchanged post costs one request per revisit.
+A verification page served instead of a post (HTTP 200, no data) holds the host for five
+minutes and the page is retried; nothing is stored.
+
+Measured 7 Nov 2026: 118 public posts, 2 s between requests, no login or cookies. First
+visit and revisits in [bench/tiktok](bench/tiktok/README.md) and
+[bench/tiktok/revisit](bench/tiktok/revisit/README.md): a visit-everything revisit costs
+368 requests and 67 MB, 77% of it post pages; a `--budget 30` revisit 30 requests and 13 MB.
+New comments found per byte is not measured yet (no comments arrived in the windows tried).
+TikTok's robots.txt allows `/@handle/video/` for rayap's user agent; its terms of service
+forbid automated collection, so keep volume low and use it only where you have the right to.
 
 ## Layout
 
@@ -160,17 +171,18 @@ and use it only where you have the right to.
 
 ## Roadmap
 
-1. Wire the revisit planner into `rayap crawl`: per-page due times from learned change
-   rates, and for structured sources revisit the cheap page first (a TikTok comment page is
-   66 KiB for up to 20 records; the post page is 428 KiB for one). Measure bytes per new
-   record and new records per fetch against today's visit-everything baseline.
-2. Batched commits and several coordinators sharded by host, to scale past one
+1. Measure new comments per KB: planned vs visit-everything revisits a day apart on posts
+   that still receive comments (the planner and the activity-gated comment pages are in;
+   the windows tried so far had no new comments in either arm).
+2. A `rebaseline` event when an extractor's fingerprint changes, so a code change never
+   reports `changed`.
+3. Batched commits and several coordinators sharded by host, to scale past one
    coordinator (see "What breaks first" in the benchmark).
-3. Conditional requests (`If-None-Match`, `If-Modified-Since`). Deferred: of the 7 real
+4. Conditional requests (`If-None-Match`, `If-Modified-Since`). Deferred: of the 7 real
    sources in `examples/` and `bench/tiktok`, checked 7 Nov 2026, only one
    (andpurpose.world) sends a validator and answers 304; the rest send neither `ETag` nor
    `Last-Modified`, so conditional requests would save nothing there.
-4. Signed requests (RFC 9421 HTTP Message Signatures, Web Bot Auth), so sites can verify rayap.
+5. Signed requests (RFC 9421 HTTP Message Signatures, Web Bot Auth), so sites can verify rayap.
 
 ## License
 
