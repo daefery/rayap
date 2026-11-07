@@ -4,7 +4,8 @@
 //! rate-limited host never blocks the others. robots.txt follows RFC 9309, every request
 //! carries a contact address, and all state lives in SQLite so an interrupted crawl resumes
 //! where it stopped. Each fetched page produces one change event (`new`, `changed`,
-//! `unchanged`, `redirect`, `gone`, `blocked`, `error`).
+//! `unchanged`, `redirect`, `gone`, `blocked`, `error`). Sources with a structured kind
+//! (`tiktok`) also yield records (`post`, `comment`) committed with the event.
 
 pub mod config;
 pub mod crawler;
@@ -14,11 +15,12 @@ pub mod html;
 pub mod revisit;
 pub mod robots;
 pub mod store;
+pub mod tiktok;
 pub mod urlnorm;
 
-pub use config::Config;
+pub use config::{Config, SourceKind};
 pub use crawler::{Options, Stats, crawl};
-pub use store::{Event, EventKind, Store};
+pub use store::{Event, EventKind, Record, Store};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -766,3 +766,170 @@ async fn long_retry_after_is_stored_in_full() {
     let days = (host_hold - rayap_core::store::unix_now_ms()) as f64 / 86_400_000.0;
     assert!(days > 39.9, "stored hold is {days:.1} days");
 }
+
+fn tiktok_config(addr: SocketAddr, max_comments: u32) -> Config {
+    Config::from_toml(&format!(
+        r#"
+        [crawler]
+        contact = "mailto:test@example.org"
+        per_host_delay_ms = 300
+        request_timeout_ms = 5000
+        max_attempts = 2
+        retry_backoff_ms = 50
+        [[source]]
+        name = "frogs"
+        url = "http://{addr}/@tiktok/video/7106594312292453675"
+        kind = "tiktok"
+        max_comments = {max_comments}
+        [[source]]
+        name = "deleted"
+        url = "http://{addr}/@x/video/1"
+        kind = "tiktok"
+        "#
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn tiktok_post_and_comments_become_records() {
+    let site = Site::default();
+    site.set(
+        "/robots.txt",
+        Reply::Text("User-agent: *\nDisallow: /inapp\n".into()),
+    );
+    site.set(
+        "/@tiktok/video/7106594312292453675",
+        Reply::Html(include_str!("fixtures/tiktok/post.html").into()),
+    );
+    site.set(
+        "/api/comment/list/?aid=1988&aweme_id=7106594312292453675&count=20&cursor=0",
+        Reply::Text(include_str!("fixtures/tiktok/comments.json").into()),
+    );
+    site.set(
+        "/api/comment/list/?aid=1988&aweme_id=7106594312292453675&count=20&cursor=20",
+        Reply::Text(include_str!("fixtures/tiktok/comments-last.json").into()),
+    );
+    site.set(
+        "/@x/video/1",
+        Reply::Html(include_str!("fixtures/tiktok/post-gone.html").into()),
+    );
+    let addr = start(site.clone()).await;
+    let cfg = tiktok_config(addr, 40);
+    let mut store = Store::open_in_memory().unwrap();
+
+    let (stats, events) = run(&cfg, &mut store, Options::default()).await;
+    assert!(stats.finished);
+    assert_eq!(
+        kinds(&events),
+        [
+            (
+                "/@tiktok/video/7106594312292453675".to_string(),
+                EventKind::New
+            ),
+            ("/@x/video/1".to_string(), EventKind::Gone),
+            ("/api/comment/list/".to_string(), EventKind::New),
+            ("/api/comment/list/".to_string(), EventKind::New),
+        ]
+    );
+    let post_event = events
+        .iter()
+        .find(|e| e.url.contains("/video/7106"))
+        .unwrap();
+    assert_eq!(
+        (post_event.records, post_event.bytes.is_some()),
+        (Some(1), true)
+    );
+    let gone = events
+        .iter()
+        .find(|e| e.url.ends_with("/@x/video/1"))
+        .unwrap();
+    assert_eq!(
+        (gone.status, gone.detail.as_deref(), gone.records),
+        (Some(200), Some("item doesn't exist"), None),
+        "a 200 for a deleted post is gone, not content"
+    );
+
+    let posts = store.records_after(0, Some("post"), 100).unwrap();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].data["author"]["handle"], "tiktok");
+    assert_eq!(posts[0].source, "frogs");
+    let comments = store.records_after(0, Some("comment"), 100).unwrap();
+    assert_eq!(comments.len(), 4, "3 on the first page + 1 on the last");
+    assert_eq!(
+        comments
+            .iter()
+            .map(|c| c.data["page_cursor"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [0, 0, 0, 20]
+    );
+    assert!(
+        comments
+            .iter()
+            .all(|c| c.data["post_id"] == "7106594312292453675")
+    );
+
+    // Politeness: robots.txt first, then every request on the host spaced by the delay.
+    let requests = site.requests();
+    assert_eq!(requests[0], "/robots.txt");
+    assert_eq!(requests.len(), 5, "{requests:?}");
+    let times = site.times();
+    for pair in times.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= std::time::Duration::from_millis(290),
+            "{requests:?}"
+        );
+    }
+    assert!(site.user_agents().iter().all(|ua| ua.contains("rayap/")));
+
+    // Second run: nothing changed, records are not duplicated.
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::Unchanged)
+            .count()
+            == 3,
+        "{:?}",
+        kinds(&events)
+    );
+    assert_eq!(store.records_after(0, None, 100).unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn tiktok_comment_cap_and_shell_pages() {
+    let site = Site::default();
+    site.set(
+        "/@tiktok/video/7106594312292453675",
+        Reply::Html(include_str!("fixtures/tiktok/post.html").into()),
+    );
+    site.set(
+        "/api/comment/list/?aid=1988&aweme_id=7106594312292453675&count=20&cursor=0",
+        Reply::Text(include_str!("fixtures/tiktok/comments.json").into()),
+    );
+    site.set(
+        "/@x/video/1",
+        Reply::Html("<html><body><div id='app'></div></body></html>".into()),
+    );
+    let addr = start(site.clone()).await;
+    let cfg = tiktok_config(addr, 20);
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert!(
+        !site.requests().iter().any(|p| p.contains("cursor=20")),
+        "max_comments = 20 stops after one page: {:?}",
+        site.requests()
+    );
+    let shell = events
+        .iter()
+        .find(|e| e.url.ends_with("/@x/video/1"))
+        .unwrap();
+    assert_eq!(shell.kind, EventKind::Error);
+    assert!(
+        shell.detail.as_deref().unwrap().contains("no embedded"),
+        "{shell:?}"
+    );
+    assert!(
+        shell.hash.is_none(),
+        "an empty shell is never fingerprinted as content"
+    );
+}

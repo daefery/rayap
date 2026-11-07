@@ -56,7 +56,19 @@ CREATE TABLE IF NOT EXISTS events (
     hash      TEXT,
     prev_hash TEXT,
     bytes     INTEGER,
-    detail    TEXT
+    detail    TEXT,
+    records   INTEGER
+);
+CREATE TABLE IF NOT EXISTS records (
+    id      INTEGER PRIMARY KEY,
+    run     INTEGER NOT NULL,
+    at      INTEGER NOT NULL,
+    source  TEXT NOT NULL,
+    url     TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    key     TEXT NOT NULL,
+    data    TEXT NOT NULL,
+    UNIQUE (kind, key)
 );
 ";
 
@@ -128,6 +140,32 @@ pub struct Event {
     pub bytes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Structured records (posts, comments) the page yielded, when the source extracts any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub records: Option<i64>,
+}
+
+/// A structured item extracted from a page (a post, a comment). `kind` and `key` identify it
+/// across runs: fetching it again replaces `data`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRecord {
+    pub kind: String,
+    pub key: String,
+    pub data: serde_json::Value,
+}
+
+/// A stored record, as `rayap records` prints it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Record {
+    pub id: i64,
+    pub run: i64,
+    /// Unix seconds of the fetch that last produced it.
+    pub at: i64,
+    pub source: String,
+    pub url: String,
+    pub kind: String,
+    pub key: String,
+    pub data: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +198,8 @@ pub struct Outcome {
     pub last_modified: Option<String>,
     pub bytes: Option<i64>,
     pub detail: Option<String>,
+    /// Committed with the event; empty for sources that only fingerprint pages.
+    pub records: Vec<NewRecord>,
 }
 
 pub struct Store {
@@ -335,10 +375,37 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Records with `id > after`, oldest first, optionally of one kind.
+    pub fn records_after(
+        &self,
+        after: i64,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Record>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run, at, source, url, kind, key, data FROM records
+             WHERE id > ?1 AND (?2 IS NULL OR kind = ?2) ORDER BY id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![after, kind, limit as i64], |r| {
+            let data: String = r.get(7)?;
+            Ok(Record {
+                id: r.get(0)?,
+                run: r.get(1)?,
+                at: r.get(2)?,
+                source: r.get(3)?,
+                url: r.get(4)?,
+                kind: r.get(5)?,
+                key: r.get(6)?,
+                data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Events with `id > after`, oldest first.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run, at, source, url, kind, status, title, hash, prev_hash, bytes, detail
+            "SELECT id, run, at, source, url, kind, status, title, hash, prev_hash, bytes, detail, records
              FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![after, limit as i64], |r| {
@@ -355,6 +422,7 @@ impl Store {
                 prev_hash: r.get(9)?,
                 bytes: r.get(10)?,
                 detail: r.get(11)?,
+                records: r.get(12)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -362,10 +430,11 @@ impl Store {
 }
 
 /// Schema version stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Brings any older database up to `SCHEMA_VERSION`. Version 1 (the first release) had no
-/// `pages.hops` column; versions 1-2 lacked tables that `SCHEMA` creates if missing.
+/// `pages.hops` column; versions 1-2 lacked tables that `SCHEMA` creates if missing; version
+/// 3 had no `events.records` column or `records` table.
 /// A database from a newer rayap is refused rather than changed.
 fn migrate(tx: &Transaction) -> Result<()> {
     let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -387,6 +456,21 @@ fn migrate(tx: &Transaction) -> Result<()> {
         )?;
         if !has_hops {
             tx.execute_batch("ALTER TABLE pages ADD COLUMN hops INTEGER NOT NULL DEFAULT 0")?;
+        }
+    }
+    let has_events: bool = tx.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_events && version < 4 {
+        let has_records: bool = tx.query_row(
+            "SELECT count(*) > 0 FROM pragma_table_info('events') WHERE name = 'records'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_records {
+            tx.execute_batch("ALTER TABLE events ADD COLUMN records INTEGER")?;
         }
     }
     tx.execute_batch(SCHEMA)?;
@@ -440,11 +524,25 @@ fn complete_in(
         .execute(params![run, o.status, now, url])?;
     }
     let prev_hash = if o.hash.is_some() { prev_hash } else { None };
+    let records = if o.records.is_empty() {
+        None
+    } else {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO records (run, at, source, url, kind, key, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (kind, key) DO UPDATE SET run = excluded.run, at = excluded.at,
+                 source = excluded.source, url = excluded.url, data = excluded.data",
+        )?;
+        for r in &o.records {
+            let data = serde_json::to_string(&r.data).expect("serde_json::Value serializes");
+            insert.execute(params![run, now, source, url, r.kind, r.key, data])?;
+        }
+        Some(o.records.len() as i64)
+    };
     tx.prepare_cached(
-        "INSERT INTO events (run, at, source, url, kind, status, title, hash, prev_hash, bytes, detail)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO events (run, at, source, url, kind, status, title, hash, prev_hash, bytes, detail, records)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?
-    .execute(params![run, now, source, url, kind.as_str(), o.status, o.title, o.hash, prev_hash, o.bytes, o.detail])?;
+    .execute(params![run, now, source, url, kind.as_str(), o.status, o.title, o.hash, prev_hash, o.bytes, o.detail, records])?;
     Ok(Event {
         id: tx.last_insert_rowid(),
         run,
@@ -458,12 +556,59 @@ fn complete_in(
         prev_hash,
         bytes: o.bytes,
         detail: o.detail,
+        records,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(kind: &str, key: &str, text: &str) -> NewRecord {
+        NewRecord {
+            kind: kind.into(),
+            key: key.into(),
+            data: serde_json::json!({ "text": text }),
+        }
+    }
+
+    #[test]
+    fn records_commit_with_the_event_and_are_replaced_by_key() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (r1, _) = s.begin_run(&["src"]).unwrap();
+        s.enqueue(r1, &page("https://a.org/")).unwrap();
+        let outcome = Outcome {
+            records: vec![record("post", "1", "hello"), record("comment", "9", "hi")],
+            ..content("h1")
+        };
+        let e = done(&mut s, r1, "https://a.org/", outcome);
+        assert_eq!(e.records, Some(2));
+        assert_eq!(
+            done(&mut s, r1, "https://a.org/", content("h1")).records,
+            None
+        );
+        s.finish_run(r1).unwrap();
+
+        let (r2, _) = s.begin_run(&["src"]).unwrap();
+        let outcome = Outcome {
+            records: vec![record("post", "1", "edited")],
+            ..content("h2")
+        };
+        done(&mut s, r2, "https://a.org/", outcome);
+        let all = s.records_after(0, None, 10).unwrap();
+        assert_eq!(all.len(), 2, "same key replaces, not duplicates");
+        let posts = s.records_after(0, Some("post"), 10).unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            (posts[0].run, posts[0].data["text"].as_str()),
+            (r2, Some("edited"))
+        );
+        assert!(
+            s.records_after(posts[0].id, Some("post"), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     fn page(url: &str) -> NewPage {
         NewPage {
@@ -476,6 +621,32 @@ mod tests {
 
     fn done(s: &mut Store, run: i64, url: &str, outcome: Outcome) -> Event {
         s.complete(run, url, None, outcome, Vec::new()).unwrap().0
+    }
+
+    #[test]
+    fn version_3_database_gains_the_records_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE runs (id INTEGER PRIMARY KEY, started_at INTEGER NOT NULL, finished_at INTEGER);
+                 CREATE TABLE pages (url TEXT PRIMARY KEY, source TEXT NOT NULL, depth INTEGER NOT NULL,
+                     hops INTEGER NOT NULL DEFAULT 0, queued_run INTEGER NOT NULL, done_run INTEGER,
+                     attempts INTEGER NOT NULL DEFAULT 0, status INTEGER, etag TEXT, last_modified TEXT,
+                     content_hash TEXT, title TEXT, fetched_at INTEGER);
+                 CREATE TABLE events (id INTEGER PRIMARY KEY, run INTEGER NOT NULL, at INTEGER NOT NULL,
+                     source TEXT NOT NULL, url TEXT NOT NULL, kind TEXT NOT NULL, status INTEGER,
+                     title TEXT, hash TEXT, prev_hash TEXT, bytes INTEGER, detail TEXT);
+                 INSERT INTO events (run, at, source, url, kind) VALUES (1, 0, 'src', 'https://x.org/', 'new');
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let events = s.events_after(0, 10).unwrap();
+        assert_eq!((events.len(), events[0].records), (1, None));
+        assert!(s.records_after(0, None, 10).unwrap().is_empty());
     }
 
     fn content(hash: &str) -> Outcome {

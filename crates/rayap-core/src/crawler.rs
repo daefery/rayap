@@ -19,11 +19,12 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep_until};
 use url::Url;
 
-use crate::fetch::{self, Clients, PageResult, RobotsResult};
+use crate::config::SourceKind;
+use crate::fetch::{self, Clients, Extractor, PageResult, RobotsResult};
 use crate::frontier::{Frontier, Next};
 use crate::robots::{self, Rules};
 use crate::store::{Event, EventKind, NewPage, Outcome, Store, unix_now_ms};
-use crate::{Config, Error, Result, urlnorm};
+use crate::{Config, Error, Result, tiktok, urlnorm};
 
 /// Delay used for 429/503 without a usable Retry-After.
 const SLOW_DOWN_DEFAULT: Duration = Duration::from_secs(60);
@@ -159,6 +160,8 @@ struct Crawler<'a, F: FnMut(&Event)> {
     /// Crawl-delay per host, per origin; a host uses the largest among its origins.
     origin_delays: HashMap<String, HashMap<String, Duration>>,
     seed_hosts: HashMap<String, String>,
+    /// How each source's pages are read, by source name.
+    extractors: HashMap<String, Extractor>,
     in_flight: usize,
     stats: Stats,
     on_event: F,
@@ -176,9 +179,19 @@ pub async fn crawl<F: FnMut(&Event)>(
     let sources: Vec<&str> = config.sources.iter().map(|s| s.name.as_str()).collect();
     let (run, resumed) = store.begin_run(&sources)?;
     let mut seed_hosts = HashMap::new();
+    let mut extractors = HashMap::new();
     for source in &config.sources {
         let url = urlnorm::normalize(&source.url, None).expect("validated in Config");
         seed_hosts.insert(source.name.clone(), urlnorm::host(&url));
+        let extractor = match source.kind {
+            SourceKind::Page => Extractor::Page {
+                product_token: config.crawler.product_token.clone(),
+            },
+            SourceKind::Tiktok => Extractor::Tiktok {
+                max_comments: source.max_comments,
+            },
+        };
+        extractors.insert(source.name.clone(), extractor);
         store.enqueue(
             run,
             &NewPage {
@@ -199,6 +212,7 @@ pub async fn crawl<F: FnMut(&Event)>(
         robots_failures: HashMap::new(),
         origin_delays: HashMap::new(),
         seed_hosts,
+        extractors,
         in_flight: 0,
         stats: Stats {
             run,
@@ -262,7 +276,10 @@ pub async fn crawl<F: FnMut(&Event)>(
                     let clients = Arc::clone(&clients);
                     let tx = tx.clone();
                     let max_body = config.crawler.max_body_bytes;
-                    let token = config.crawler.product_token.clone();
+                    let extractor = match &job {
+                        Job::Page(page) => crawler.extractors.get(&page.source).cloned(),
+                        Job::Robots { .. } => None,
+                    };
                     tasks.spawn(async move {
                         let done = match job {
                             Job::Robots { origin, url, hops } => {
@@ -276,8 +293,10 @@ pub async fn crawl<F: FnMut(&Event)>(
                             }
                             Job::Page(page) => {
                                 let url = Url::parse(&page.url).expect("stored URLs are valid");
+                                let extractor =
+                                    extractor.expect("every page belongs to a configured source");
                                 let result =
-                                    fetch::fetch_page(&clients, &url, max_body, &token).await;
+                                    fetch::fetch_page(&clients, &url, max_body, &extractor).await;
                                 Done::Page { host, page, result }
                             }
                         };
@@ -623,6 +642,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 title,
                 hash,
                 links,
+                next,
+                records,
                 etag,
                 last_modified,
             } => {
@@ -635,9 +656,40 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                     last_modified,
                     bytes: Some(bytes as i64),
                     detail: None,
+                    records,
                 };
-                let discovered = self.links_to_follow(&page, links);
+                let mut discovered = self.links_to_follow(&page, links);
+                // Continuation pages are part of this page, not links: same depth, no limit.
+                discovered.extend(next.into_iter().map(|u| NewPage {
+                    url: u.to_string(),
+                    source: page.source.clone(),
+                    depth: page.depth,
+                    hops: 0,
+                }));
                 self.commit(&page.url, None, outcome, discovered)?;
+                Ok(delay)
+            }
+            PageResult::Invalid {
+                status,
+                bytes,
+                reason,
+            } => {
+                self.stats.bytes += bytes as u64;
+                let (kind, detail) = match reason {
+                    tiktok::Invalid::Gone(d) => (EventKind::Gone, d),
+                    tiktok::Invalid::Error(d) => (EventKind::Error, d),
+                };
+                self.commit(
+                    &page.url,
+                    Some(kind),
+                    Outcome {
+                        status: Some(status),
+                        bytes: Some(bytes as i64),
+                        detail: Some(detail),
+                        ..Outcome::default()
+                    },
+                    Vec::new(),
+                )?;
                 Ok(delay)
             }
             PageResult::Redirect { status, location } => {

@@ -95,6 +95,40 @@ An event:
 
 `id` only increases, so a consumer can store the last id it processed and read on from there.
 
+### Structured sources: TikTok posts
+
+A source with `kind = "tiktok"` reads a public post and its comments into records instead
+of a text fingerprint. The post page embeds its data as JSON; comments come from the
+paginated comment endpoint on the same host. Every request still goes through the host
+queue, robots.txt and the stored holds. A `200` is not trusted blindly: a page without the
+embedded data (challenge screen, empty application shell) is an `error`, a deleted or
+under-review post is `gone`, and neither is recorded as content.
+
+```toml
+[[source]]
+name = "frogs"
+url = "https://www.tiktok.com/@tiktok/video/7106594312292453675"
+kind = "tiktok"
+max_comments = 60   # top-level comments to collect, in pages of 20
+```
+
+```sh
+./target/release/rayap crawl -c sources.toml --db tiktok.db
+./target/release/rayap records --db tiktok.db --kind post
+./target/release/rayap records --db tiktok.db --kind comment --after 0
+```
+
+A `post` record carries `author`, `text`, `hashtags`, `mentions`, `music`, `duration_s`,
+`created_at` and `stats` (plays, likes, comments, shares, saves); a `comment` record carries
+`post_id`, `comment_id`, `author`, `text`, `likes`, `replies`, `created_at`. The change
+fingerprint covers ids and text only, so a like count moving is not a change. Records are
+keyed by `(kind, key)` and replaced when fetched again.
+
+Measured 7 Nov 2026: 118 public posts, 2 s between requests, no login or cookies. See
+[bench/tiktok](bench/tiktok/README.md). TikTok's robots.txt allows `/@handle/video/` for
+rayap's user agent; its terms of service forbid automated collection, so keep volume low
+and use it only where you have the right to.
+
 ## Layout
 
 | Path | What |
@@ -104,6 +138,7 @@ An event:
 | `crates/rayap-core/src/robots.rs` | RFC 9309 parser and matcher |
 | `crates/rayap-core/src/store.rs` | SQLite state, runs, resumable progress, events |
 | `crates/rayap-core/src/html.rs` | streaming extraction (title, text, links, nofollow) with `lol_html` |
+| `crates/rayap-core/src/tiktok.rs` | TikTok post and comment pages into `post` / `comment` records |
 | `crates/rayap-core/tests/crawl.rs` | end-to-end tests against a local server |
 | `crates/rayap-cli` | the `rayap` command |
 | `crates/rayap-sim` | simulated web plus an independent politeness referee |

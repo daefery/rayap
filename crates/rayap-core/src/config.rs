@@ -58,6 +58,26 @@ pub struct Source {
     /// How many links away from `url` to follow, on the same host. 0 = only `url` itself.
     #[serde(default)]
     pub max_depth: u32,
+    /// How the pages of this source are read. Default: fingerprint the visible text.
+    #[serde(default)]
+    pub kind: SourceKind,
+    /// For `kind = "tiktok"`: comments to collect per post (rounded up to whole API pages).
+    #[serde(default = "default_max_comments")]
+    pub max_comments: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    /// Any web page: title, visible-text fingerprint, links.
+    #[default]
+    Page,
+    /// A public TikTok post (`/@handle/video/<id>`): `post` and `comment` records.
+    Tiktok,
+}
+
+fn default_max_comments() -> u32 {
+    60
 }
 
 fn default_product_token() -> String {
@@ -128,10 +148,21 @@ impl Config {
                     source.name
                 )));
             }
-            if urlnorm::normalize(&source.url, None).is_none() {
+            let Some(url) = urlnorm::normalize(&source.url, None) else {
                 return Err(Error::Config(format!(
                     "source '{}': '{}' is not an http(s) URL",
                     source.name, source.url
+                )));
+            };
+            if source.kind == SourceKind::Tiktok
+                && !matches!(
+                    crate::tiktok::classify(&url),
+                    Some(crate::tiktok::Page::Post { .. })
+                )
+            {
+                return Err(Error::Config(format!(
+                    "source '{}': a tiktok source must be a post URL like https://www.tiktok.com/@handle/video/<id>",
+                    source.name
                 )));
             }
         }
@@ -218,6 +249,28 @@ mod tests {
         let dup = format!("{MINIMAL}\n[[source]]\nname = \"ngs\"\nurl = \"https://example.org\"\n");
         assert!(
             matches!(Config::from_toml(&dup), Err(Error::Config(m)) if m.contains("duplicate"))
+        );
+    }
+
+    #[test]
+    fn tiktok_sources_must_be_post_urls() {
+        let ok = MINIMAL.replace(
+            "https://www.nationalgeographic.org/explore/grants-investments",
+            "https://www.tiktok.com/@tiktok/video/7106594312292453675\"\nkind = \"tiktok",
+        );
+        let cfg = Config::from_toml(&ok).unwrap();
+        assert_eq!(
+            (cfg.sources[0].kind, cfg.sources[0].max_comments),
+            (SourceKind::Tiktok, 60)
+        );
+        let bad = MINIMAL.replace(
+            "url = \"https://www.nationalgeographic.org/explore/grants-investments\"",
+            "url = \"https://www.tiktok.com/@tiktok\"\nkind = \"tiktok\"",
+        );
+        assert!(matches!(Config::from_toml(&bad), Err(Error::Config(m)) if m.contains("post URL")));
+        assert_eq!(
+            Config::from_toml(MINIMAL).unwrap().sources[0].kind,
+            SourceKind::Page
         );
     }
 

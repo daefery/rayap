@@ -10,7 +10,17 @@ use reqwest::{Client, Response, redirect};
 use url::Url;
 
 use crate::robots::MAX_ROBOTS_BYTES;
-use crate::{Config, Result, html, urlnorm};
+use crate::store::NewRecord;
+use crate::{Config, Result, html, tiktok, urlnorm};
+
+/// How a fetched body is read, decided by the source's kind.
+#[derive(Debug, Clone)]
+pub enum Extractor {
+    /// Title, visible-text fingerprint and links; `product_token` scopes `<meta name=...>`.
+    Page { product_token: String },
+    /// TikTok post and comment pages into records.
+    Tiktok { max_comments: u32 },
+}
 
 pub struct Clients {
     http: Client,
@@ -55,11 +65,23 @@ pub enum PageResult {
         status: u16,
         bytes: usize,
         title: Option<String>,
-        /// Fingerprint of the title and visible text (HTML) or of the raw body (other types).
+        /// Fingerprint of the title and visible text (HTML), of the raw body (other types), or
+        /// of the extracted records' identity and text (record sources).
         hash: String,
+        /// Links found on the page; followed on the source's host while depth allows.
         links: Vec<Url>,
+        /// Pages that complete this one (the next comment page); always followed.
+        next: Vec<Url>,
+        records: Vec<NewRecord>,
         etag: Option<String>,
         last_modified: Option<String>,
+    },
+    /// A 2xx body the extractor refuses to record as content: a challenge page, an empty
+    /// application shell, or a post that no longer exists.
+    Invalid {
+        status: u16,
+        bytes: usize,
+        reason: tiktok::Invalid,
     },
     Redirect {
         status: u16,
@@ -84,7 +106,7 @@ pub async fn fetch_page(
     clients: &Clients,
     url: &Url,
     max_body: usize,
-    product_token: &str,
+    extractor: &Extractor,
 ) -> PageResult {
     let response = match clients.http.get(url.clone()).send().await {
         Ok(r) => r,
@@ -99,18 +121,42 @@ pub async fn fetch_page(
             let etag = header(headers, ETAG.as_str());
             let last_modified = header(headers, LAST_MODIFIED.as_str());
             match read_limited(response, max_body).await {
-                Ok(Some(body)) => {
-                    let (title, hash, links) = digest(&body, is_html, url, product_token);
-                    PageResult::Body {
-                        status,
-                        bytes: body.len(),
-                        title,
-                        hash,
-                        links,
-                        etag,
-                        last_modified,
+                Ok(Some(body)) => match extractor {
+                    Extractor::Page { product_token } => {
+                        let (title, hash, links) = digest(&body, is_html, url, product_token);
+                        PageResult::Body {
+                            status,
+                            bytes: body.len(),
+                            title,
+                            hash,
+                            links,
+                            next: Vec::new(),
+                            records: Vec::new(),
+                            etag,
+                            last_modified,
+                        }
                     }
-                }
+                    Extractor::Tiktok { max_comments } => {
+                        match tiktok::extract(url, &body, *max_comments) {
+                            Ok(out) => PageResult::Body {
+                                status,
+                                bytes: body.len(),
+                                title: None,
+                                hash: blake3::hash(&out.fingerprint).to_hex().to_string(),
+                                links: Vec::new(),
+                                next: out.next,
+                                records: out.records,
+                                etag,
+                                last_modified,
+                            },
+                            Err(reason) => PageResult::Invalid {
+                                status,
+                                bytes: body.len(),
+                                reason,
+                            },
+                        }
+                    }
+                },
                 Ok(None) => PageResult::TooLarge {
                     status,
                     limit: max_body,
