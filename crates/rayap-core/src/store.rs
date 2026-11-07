@@ -8,10 +8,15 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::HashMap;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 
 use crate::Result;
+use crate::revisit::{self, Observation, Prior};
+
+const SECONDS_PER_DAY: f64 = 86_400.0;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -32,9 +37,18 @@ CREATE TABLE IF NOT EXISTS pages (
     last_modified TEXT,
     content_hash  TEXT,
     title         TEXT,
-    fetched_at    INTEGER
+    fetched_at    INTEGER,
+    content_at    INTEGER,
+    continuation  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS pages_pending ON pages (queued_run, done_run);
+CREATE TABLE IF NOT EXISTS revisits (
+    url           TEXT NOT NULL,
+    at            INTEGER NOT NULL,
+    interval_days REAL NOT NULL,
+    changed       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS revisits_url ON revisits (url, at);
 CREATE TABLE IF NOT EXISTS robots_failures (
     origin   TEXT PRIMARY KEY,
     run      INTEGER NOT NULL,
@@ -185,6 +199,30 @@ pub struct NewPage {
     pub source: String,
     pub depth: u32,
     pub hops: u32,
+    /// Part of another page (the next page of a comment list): fetched when that page is new
+    /// or changed, never planned on its own.
+    pub continuation: bool,
+}
+
+/// How a new run chooses which known pages to visit. Without a plan, every known page of a
+/// configured source is visited each run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    /// Pages to visit this run, beyond never-fetched ones and whatever the visited pages lead to.
+    pub budget: usize,
+    /// Every page is visited at least this often, however rarely it seems to change.
+    pub max_interval_days: f64,
+    pub prior: Prior,
+}
+
+/// What `begin_run` decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunStart {
+    pub run: i64,
+    /// An unfinished run was picked up; nothing was re-planned.
+    pub resumed: bool,
+    /// Known pages left for a later run by the plan.
+    pub deferred: u64,
 }
 
 /// What a fetch produced, ready to be committed.
@@ -235,9 +273,9 @@ impl Store {
     }
 
     /// Returns the unfinished run if there is one (resume), otherwise starts a new run and
-    /// re-queues every known page whose source is still configured.
-    /// The bool is true when an unfinished run was resumed.
-    pub fn begin_run(&mut self, sources: &[&str]) -> Result<(i64, bool)> {
+    /// queues known pages of the configured sources: all of them, or, with a plan, the
+    /// never-fetched ones plus the `budget` most due by learned change rate.
+    pub fn begin_run(&mut self, sources: &[&str], plan: Option<&Plan>) -> Result<RunStart> {
         let open: Option<i64> = self
             .conn
             .query_row(
@@ -247,20 +285,59 @@ impl Store {
             )
             .optional()?;
         if let Some(run) = open {
-            return Ok((run, true));
+            return Ok(RunStart {
+                run,
+                resumed: true,
+                deferred: 0,
+            });
         }
         let tx = self.conn.transaction()?;
         tx.execute("INSERT INTO runs (started_at) VALUES (?1)", [unix_now()])?;
         let run = tx.last_insert_rowid();
-        {
-            let mut requeue =
-                tx.prepare("UPDATE pages SET queued_run = ?1, attempts = 0 WHERE source = ?2")?;
-            for source in sources {
-                requeue.execute(params![run, source])?;
+        let deferred = match plan {
+            None => {
+                let mut requeue =
+                    tx.prepare("UPDATE pages SET queued_run = ?1, attempts = 0 WHERE source = ?2")?;
+                for source in sources {
+                    requeue.execute(params![run, source])?;
+                }
+                0
             }
-        }
+            Some(plan) => {
+                let chosen = choose_due(&tx, sources, plan, unix_now())?;
+                let mut queue =
+                    tx.prepare("UPDATE pages SET queued_run = ?1, attempts = 0 WHERE url = ?2")?;
+                for url in &chosen.urls {
+                    queue.execute(params![run, url])?;
+                }
+                chosen.deferred
+            }
+        };
         tx.commit()?;
-        Ok((run, false))
+        Ok(RunStart {
+            run,
+            resumed: false,
+            deferred,
+        })
+    }
+
+    /// Adds a page to run `run` only if it is not known at all. Returns true if it was added.
+    pub fn enqueue_if_unknown(&self, run: i64, page: &NewPage) -> Result<bool> {
+        let changed = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO pages (url, source, depth, hops, continuation, queued_run)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (url) DO NOTHING",
+            )?
+            .execute(params![
+                page.url,
+                page.source,
+                page.depth,
+                page.hops,
+                page.continuation,
+                run
+            ])?;
+        Ok(changed > 0)
     }
 
     pub fn finish_run(&self, run: i64) -> Result<()> {
@@ -306,6 +383,7 @@ impl Store {
     /// Returns the event and the discovered pages that are new to this run (to be put in the
     /// frontier). For content outcomes (`hash` is set) the kind is decided here from the
     /// stored hash: `New`, `Changed` or `Unchanged`. Other kinds are taken as given.
+    /// `continuation` pages are queued only when the outcome is `New` or `Changed`.
     pub fn complete(
         &mut self,
         run: i64,
@@ -313,17 +391,39 @@ impl Store {
         kind: Option<EventKind>,
         outcome: Outcome,
         discovered: Vec<NewPage>,
+        continuation: Vec<NewPage>,
     ) -> Result<(Event, Vec<NewPage>)> {
         let tx = self.conn.transaction()?;
         let event = complete_in(&tx, run, url, kind, outcome)?;
         let mut added = Vec::new();
-        for page in discovered {
+        let follow = matches!(event.kind, EventKind::New | EventKind::Changed);
+        let continuation = if follow { continuation } else { Vec::new() };
+        for page in discovered.into_iter().chain(continuation) {
             if enqueue_in(&tx, run, &page)? {
                 added.push(page);
             }
         }
         tx.commit()?;
         Ok((event, added))
+    }
+
+    /// Learned change rate (per day) of each known page of `source`, for inspection.
+    pub fn rates(&self, source: &str, prior: Prior) -> Result<Vec<(String, f64)>> {
+        let observations = observations_in(&self.conn)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT url FROM pages WHERE source = ?1 AND continuation = 0 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([source], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for url in rows {
+            let url = url?;
+            let obs = observations
+                .get(&url)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            out.push((url, revisit::estimate_rate(obs, prior)));
+        }
+        Ok(out)
     }
 
     /// Persists that `host` must not be contacted before `until_ms` (Unix milliseconds).
@@ -429,12 +529,105 @@ impl Store {
     }
 }
 
+struct Chosen {
+    urls: Vec<String>,
+    deferred: u64,
+}
+
+/// The pages a planned run visits: every never-fetched page, then the `budget` pages that
+/// are most overdue, where overdue is the time since the last fetch times the revisit
+/// frequency the planner gives the page from its learned change rate.
+fn choose_due(conn: &Connection, sources: &[&str], plan: &Plan, now: i64) -> Result<Chosen> {
+    struct Candidate {
+        url: String,
+        elapsed_days: Option<f64>,
+    }
+    let observations = observations_in(conn)?;
+    let mut candidates = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT url, coalesce(content_at, fetched_at) FROM pages
+         WHERE source = ?1 AND continuation = 0 ORDER BY rowid",
+    )?;
+    for source in sources {
+        let rows = stmt.query_map([source], |r| {
+            Ok(Candidate {
+                url: r.get(0)?,
+                elapsed_days: r
+                    .get::<_, Option<i64>>(1)?
+                    .map(|at| (now - at).max(0) as f64 / SECONDS_PER_DAY),
+            })
+        })?;
+        for c in rows {
+            candidates.push(c?);
+        }
+    }
+    let rates: Vec<f64> = candidates
+        .iter()
+        .map(|c| {
+            let obs = observations
+                .get(&c.url)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            revisit::estimate_rate(obs, plan.prior)
+        })
+        .collect();
+    let weights = vec![1.0; rates.len()];
+    let floor = 1.0 / plan.max_interval_days.max(1e-9);
+    let frequencies = revisit::allocate(&rates, &weights, plan.budget as f64, floor);
+    let mut order: Vec<(f64, usize)> = candidates
+        .iter()
+        .zip(&frequencies)
+        .enumerate()
+        .map(|(i, (c, f))| (c.elapsed_days.map_or(f64::INFINITY, |d| d * f), i))
+        .collect();
+    order.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut urls = Vec::new();
+    let mut spent = 0;
+    for (priority, i) in order {
+        let never_fetched = priority.is_infinite();
+        if !never_fetched {
+            if spent >= plan.budget {
+                break;
+            }
+            spent += 1;
+        }
+        urls.push(candidates[i].url.clone());
+    }
+    let deferred = (candidates.len() - urls.len()) as u64;
+    Ok(Chosen { urls, deferred })
+}
+
+/// Every page's revisit observations, newest first, at most 64 per page.
+fn observations_in(conn: &Connection) -> Result<HashMap<String, Vec<Observation>>> {
+    let mut stmt =
+        conn.prepare("SELECT url, interval_days, changed FROM revisits ORDER BY url, at DESC")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Observation {
+                interval: r.get(1)?,
+                changed: r.get::<_, i64>(2)? != 0,
+            },
+        ))
+    })?;
+    let mut out: HashMap<String, Vec<Observation>> = HashMap::new();
+    for row in rows {
+        let (url, obs) = row?;
+        let list = out.entry(url).or_default();
+        if list.len() < 64 {
+            list.push(obs);
+        }
+    }
+    Ok(out)
+}
+
 /// Schema version stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Brings any older database up to `SCHEMA_VERSION`. Version 1 (the first release) had no
 /// `pages.hops` column; versions 1-2 lacked tables that `SCHEMA` creates if missing; version
-/// 3 had no `events.records` column or `records` table.
+/// 3 had no `events.records` column or `records` table; version 4 had no
+/// `pages.content_at`, `pages.continuation` or `revisits`.
 /// A database from a newer rayap is refused rather than changed.
 fn migrate(tx: &Transaction) -> Result<()> {
     let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -473,6 +666,29 @@ fn migrate(tx: &Transaction) -> Result<()> {
             tx.execute_batch("ALTER TABLE events ADD COLUMN records INTEGER")?;
         }
     }
+    if has_pages && version < 5 {
+        for (column, definition) in [
+            ("content_at", "INTEGER"),
+            ("continuation", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let present: bool = tx.query_row(
+                "SELECT count(*) > 0 FROM pragma_table_info('pages') WHERE name = ?1",
+                [column],
+                |r| r.get(0),
+            )?;
+            if !present {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE pages ADD COLUMN {column} {definition}"
+                ))?;
+            }
+        }
+        // Pages fetched before this version: their last content fetch is their last fetch,
+        // and TikTok comment pages (the only continuation pages so far) are marked as such.
+        tx.execute_batch(
+            "UPDATE pages SET content_at = fetched_at WHERE content_at IS NULL AND content_hash IS NOT NULL;
+             UPDATE pages SET continuation = 1 WHERE url LIKE '%/api/comment/list/?%';",
+        )?;
+    }
     tx.execute_batch(SCHEMA)?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -481,12 +697,21 @@ fn migrate(tx: &Transaction) -> Result<()> {
 fn enqueue_in(conn: &Connection, run: i64, page: &NewPage) -> Result<bool> {
     let changed = conn
         .prepare_cached(
-            "INSERT INTO pages (url, source, depth, hops, queued_run) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO pages (url, source, depth, hops, continuation, queued_run)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (url) DO UPDATE SET queued_run = excluded.queued_run, attempts = 0,
-                 source = excluded.source, depth = excluded.depth, hops = excluded.hops
+                 source = excluded.source, depth = excluded.depth, hops = excluded.hops,
+                 continuation = excluded.continuation
              WHERE pages.queued_run < excluded.queued_run",
         )?
-        .execute(params![page.url, page.source, page.depth, page.hops, run])?;
+        .execute(params![
+            page.url,
+            page.source,
+            page.depth,
+            page.hops,
+            page.continuation,
+            run
+        ])?;
     Ok(changed > 0)
 }
 
@@ -497,9 +722,9 @@ fn complete_in(
     kind: Option<EventKind>,
     o: Outcome,
 ) -> Result<Event> {
-    let (source, prev_hash): (String, Option<String>) = tx
-        .prepare_cached("SELECT source, content_hash FROM pages WHERE url = ?1")?
-        .query_row([url], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let (source, prev_hash, content_at): (String, Option<String>, Option<i64>) = tx
+        .prepare_cached("SELECT source, content_hash, content_at FROM pages WHERE url = ?1")?
+        .query_row([url], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     let kind = match (&o.hash, kind) {
         (Some(hash), _) => match &prev_hash {
             None => EventKind::New,
@@ -513,9 +738,18 @@ fn complete_in(
     if o.hash.is_some() {
         tx.prepare_cached(
             "UPDATE pages SET done_run = ?1, status = ?2, etag = ?3, last_modified = ?4, content_hash = ?5,
-                 title = ?6, fetched_at = ?7 WHERE url = ?8",
+                 title = ?6, fetched_at = ?7, content_at = ?7 WHERE url = ?8",
         )?
         .execute(params![run, o.status, o.etag, o.last_modified, o.hash, o.title, now, url])?;
+        // What a revisit showed, for the change-rate estimate: only comparisons count, so
+        // a first fetch records nothing.
+        if let (Some(previous), Some(_)) = (content_at, &prev_hash) {
+            let interval_days = (now - previous).max(0) as f64 / SECONDS_PER_DAY;
+            tx.prepare_cached(
+                "INSERT INTO revisits (url, at, interval_days, changed) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![url, now, interval_days, kind == EventKind::Changed])?;
+        }
     } else {
         // Keep the last good fingerprint so a page that comes back is compared with it.
         tx.prepare_cached(
@@ -575,7 +809,7 @@ mod tests {
     #[test]
     fn records_commit_with_the_event_and_are_replaced_by_key() {
         let mut s = Store::open_in_memory().unwrap();
-        let (r1, _) = s.begin_run(&["src"]).unwrap();
+        let (r1, _) = begin(&mut s);
         s.enqueue(r1, &page("https://a.org/")).unwrap();
         let outcome = Outcome {
             records: vec![record("post", "1", "hello"), record("comment", "9", "hi")],
@@ -589,7 +823,7 @@ mod tests {
         );
         s.finish_run(r1).unwrap();
 
-        let (r2, _) = s.begin_run(&["src"]).unwrap();
+        let (r2, _) = begin(&mut s);
         let outcome = Outcome {
             records: vec![record("post", "1", "edited")],
             ..content("h2")
@@ -616,11 +850,245 @@ mod tests {
             source: "src".into(),
             depth: 0,
             hops: 0,
+            continuation: false,
         }
     }
 
     fn done(s: &mut Store, run: i64, url: &str, outcome: Outcome) -> Event {
-        s.complete(run, url, None, outcome, Vec::new()).unwrap().0
+        s.complete(run, url, None, outcome, Vec::new(), Vec::new())
+            .unwrap()
+            .0
+    }
+
+    fn begin(s: &mut Store) -> (i64, bool) {
+        let start = s.begin_run(&["src"], None).unwrap();
+        (start.run, start.resumed)
+    }
+
+    fn plan(budget: usize) -> Plan {
+        Plan {
+            budget,
+            max_interval_days: 30.0,
+            prior: Prior {
+                rate: 0.2,
+                weight: 0.5,
+            },
+        }
+    }
+
+    /// Backdates a page's last fetch so a plan sees time as having passed.
+    fn age(s: &Store, url: &str, days: f64) {
+        let at = unix_now() - (days * SECONDS_PER_DAY) as i64;
+        s.conn
+            .execute(
+                "UPDATE pages SET fetched_at = ?1, content_at = ?1 WHERE url = ?2",
+                params![at, url],
+            )
+            .unwrap();
+    }
+
+    fn observe(s: &Store, url: &str, interval_days: f64, changed: bool) {
+        s.conn
+            .execute(
+                "INSERT INTO revisits (url, at, interval_days, changed) VALUES (?1, ?2, ?3, ?4)",
+                params![url, unix_now(), interval_days, changed],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn revisits_record_interval_and_change_only_when_comparable() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (r1, _) = begin(&mut s);
+        s.enqueue(r1, &page("https://a.org/")).unwrap();
+        done(&mut s, r1, "https://a.org/", content("h1"));
+        let count = |s: &Store| -> i64 {
+            s.conn
+                .query_row("SELECT count(*) FROM revisits", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&s), 0, "a first fetch is not a revisit");
+        s.finish_run(r1).unwrap();
+        age(&s, "https://a.org/", 2.0);
+
+        let (r2, _) = begin(&mut s);
+        let gone = Outcome {
+            status: Some(500),
+            ..Outcome::default()
+        };
+        s.complete(
+            r2,
+            "https://a.org/",
+            Some(EventKind::Error),
+            gone,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(count(&s), 0, "an error is not a comparison");
+        s.finish_run(r2).unwrap();
+
+        let (r3, _) = begin(&mut s);
+        done(&mut s, r3, "https://a.org/", content("h2"));
+        let (interval, changed): (f64, bool) = s
+            .conn
+            .query_row("SELECT interval_days, changed FROM revisits", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert!(
+            (interval - 2.0).abs() < 0.01,
+            "measured from the last content fetch, not the error: {interval}"
+        );
+        assert!(changed);
+    }
+
+    #[test]
+    fn planned_run_takes_unfetched_pages_then_the_most_overdue() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (r1, _) = begin(&mut s);
+        for u in [
+            "https://a.org/busy",
+            "https://a.org/quiet",
+            "https://a.org/fresh",
+        ] {
+            s.enqueue(r1, &page(u)).unwrap();
+            done(&mut s, r1, u, content(u));
+        }
+        s.enqueue(r1, &page("https://a.org/never")).unwrap();
+        s.finish_run(r1).unwrap();
+        // busy changed on 4 of 10 daily visits; quiet on none; fresh was fetched just now.
+        for i in 0..10 {
+            observe(&s, "https://a.org/busy", 1.0, i % 5 < 2);
+            observe(&s, "https://a.org/quiet", 1.0, false);
+        }
+        age(&s, "https://a.org/busy", 3.0);
+        age(&s, "https://a.org/quiet", 3.0);
+
+        let start = s.begin_run(&["src"], Some(&plan(1))).unwrap();
+        assert!(!start.resumed);
+        let pending: Vec<String> = s
+            .pending(start.run)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.url)
+            .collect();
+        assert_eq!(
+            pending,
+            ["https://a.org/busy", "https://a.org/never"],
+            "the never-fetched page is free; the one budget slot goes to the overdue page that changes"
+        );
+        assert_eq!(
+            start.deferred, 2,
+            "quiet (rarely changes) and fresh (just fetched) wait"
+        );
+
+        let rates = s.rates("src", plan(1).prior).unwrap();
+        let rate = |u: &str| rates.iter().find(|(x, _)| x == u).unwrap().1;
+        assert!(
+            rate("https://a.org/busy") > 0.3,
+            "{}",
+            rate("https://a.org/busy")
+        );
+        assert!(
+            rate("https://a.org/quiet") < 0.05,
+            "{}",
+            rate("https://a.org/quiet")
+        );
+        assert_eq!(rates.len(), 4);
+    }
+
+    #[test]
+    fn continuation_pages_follow_only_new_or_changed_and_are_never_planned() {
+        let mut s = Store::open_in_memory().unwrap();
+        let next = NewPage {
+            continuation: true,
+            ..page("https://a.org/?cursor=20")
+        };
+        let (r1, _) = begin(&mut s);
+        s.enqueue(r1, &page("https://a.org/")).unwrap();
+        let (_, added) = s
+            .complete(
+                r1,
+                "https://a.org/",
+                None,
+                content("h1"),
+                Vec::new(),
+                vec![next.clone()],
+            )
+            .unwrap();
+        assert_eq!(added, [next.clone()].as_slice(), "new: the continuation is queued");
+        done(&mut s, r1, "https://a.org/?cursor=20", content("c1"));
+        s.finish_run(r1).unwrap();
+
+        age(&s, "https://a.org/", 40.0);
+        age(&s, "https://a.org/?cursor=20", 40.0);
+        let start = s.begin_run(&["src"], Some(&plan(10))).unwrap();
+        let pending: Vec<String> = s
+            .pending(start.run)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.url)
+            .collect();
+        assert_eq!(
+            pending,
+            ["https://a.org/"],
+            "the continuation is not planned on its own"
+        );
+        let (_, added) = s
+            .complete(
+                start.run,
+                "https://a.org/",
+                None,
+                content("h1"),
+                Vec::new(),
+                vec![next.clone()],
+            )
+            .unwrap();
+        assert!(
+            added.is_empty(),
+            "unchanged: the continuation is not fetched"
+        );
+        s.finish_run(start.run).unwrap();
+
+        age(&s, "https://a.org/", 40.0);
+        let start = s.begin_run(&["src"], Some(&plan(10))).unwrap();
+        let (_, added) = s
+            .complete(
+                start.run,
+                "https://a.org/",
+                None,
+                content("h2"),
+                Vec::new(),
+                vec![next.clone()],
+            )
+            .unwrap();
+        assert_eq!(added, [next], "changed: the continuation is fetched again");
+    }
+
+    #[test]
+    fn seeds_are_not_forced_into_a_planned_run() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (r1, _) = begin(&mut s);
+        s.enqueue(r1, &page("https://a.org/")).unwrap();
+        done(&mut s, r1, "https://a.org/", content("h"));
+        s.finish_run(r1).unwrap();
+        let start = s.begin_run(&["src"], Some(&plan(0))).unwrap();
+        assert!(
+            !s.enqueue_if_unknown(start.run, &page("https://a.org/"))
+                .unwrap()
+        );
+        assert!(
+            s.enqueue_if_unknown(start.run, &page("https://a.org/new"))
+                .unwrap()
+        );
+        let pending: Vec<String> = s
+            .pending(start.run)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.url)
+            .collect();
+        assert_eq!(pending, ["https://a.org/new"]);
     }
 
     #[test]
@@ -660,7 +1128,7 @@ mod tests {
     #[test]
     fn new_then_unchanged_then_changed() {
         let mut s = Store::open_in_memory().unwrap();
-        let (r1, resumed) = s.begin_run(&["src"]).unwrap();
+        let (r1, resumed) = begin(&mut s);
         assert!(!resumed);
         assert!(s.enqueue(r1, &page("https://a.org/")).unwrap());
         assert!(
@@ -673,7 +1141,7 @@ mod tests {
         );
         s.finish_run(r1).unwrap();
 
-        let (r2, _) = s.begin_run(&["src"]).unwrap();
+        let (r2, _) = begin(&mut s);
         assert_eq!(
             s.pending(r2).unwrap().len(),
             1,
@@ -685,7 +1153,7 @@ mod tests {
         );
         s.finish_run(r2).unwrap();
 
-        let (r3, _) = s.begin_run(&["src"]).unwrap();
+        let (r3, _) = begin(&mut s);
         let e = done(&mut s, r3, "https://a.org/", content("h2"));
         assert_eq!(
             (e.kind, e.prev_hash.as_deref()),
@@ -696,12 +1164,12 @@ mod tests {
     #[test]
     fn errors_keep_the_last_good_fingerprint() {
         let mut s = Store::open_in_memory().unwrap();
-        let (r1, _) = s.begin_run(&["src"]).unwrap();
+        let (r1, _) = begin(&mut s);
         s.enqueue(r1, &page("https://a.org/")).unwrap();
         done(&mut s, r1, "https://a.org/", content("h1"));
         s.finish_run(r1).unwrap();
 
-        let (r2, _) = s.begin_run(&["src"]).unwrap();
+        let (r2, _) = begin(&mut s);
         let gone = Outcome {
             status: Some(404),
             ..Outcome::default()
@@ -712,6 +1180,7 @@ mod tests {
                 "https://a.org/",
                 Some(EventKind::Gone),
                 gone,
+                Vec::new(),
                 Vec::new()
             )
             .unwrap()
@@ -721,7 +1190,7 @@ mod tests {
         );
         s.finish_run(r2).unwrap();
 
-        let (r3, _) = s.begin_run(&["src"]).unwrap();
+        let (r3, _) = begin(&mut s);
         assert_eq!(
             done(&mut s, r3, "https://a.org/", content("h1")).kind,
             EventKind::Unchanged
@@ -734,7 +1203,7 @@ mod tests {
         let path = dir.path().join("state.db");
         {
             let mut s = Store::open(&path).unwrap();
-            let (r1, _) = s.begin_run(&["src"]).unwrap();
+            let (r1, _) = begin(&mut s);
             for u in ["https://a.org/1", "https://a.org/2"] {
                 s.enqueue(r1, &page(u)).unwrap();
             }
@@ -743,7 +1212,7 @@ mod tests {
             // process stops here without finish_run
         }
         let mut s = Store::open(&path).unwrap();
-        let (run, resumed) = s.begin_run(&["src"]).unwrap();
+        let (run, resumed) = begin(&mut s);
         assert!(resumed);
         assert_eq!(
             s.pending(run).unwrap(),
@@ -760,7 +1229,10 @@ mod tests {
     #[test]
     fn removed_sources_are_not_requeued() {
         let mut s = Store::open_in_memory().unwrap();
-        let (r1, _) = s.begin_run(&["old"]).unwrap();
+        let (r1, _) = {
+            let st = s.begin_run(&["old"], None).unwrap();
+            (st.run, st.resumed)
+        };
         s.enqueue(
             r1,
             &NewPage {
@@ -771,7 +1243,10 @@ mod tests {
         .unwrap();
         done(&mut s, r1, "https://a.org/", content("h"));
         s.finish_run(r1).unwrap();
-        let (r2, _) = s.begin_run(&["new"]).unwrap();
+        let (r2, _) = {
+            let st = s.begin_run(&["new"], None).unwrap();
+            (st.run, st.resumed)
+        };
         assert!(s.pending(r2).unwrap().is_empty());
     }
 
@@ -797,7 +1272,7 @@ mod tests {
             .unwrap();
         }
         let mut s = Store::open(&path).unwrap();
-        let (run, resumed) = s.begin_run(&["src"]).unwrap();
+        let (run, resumed) = begin(&mut s);
         assert!(resumed);
         assert_eq!(s.pending(run).unwrap()[0].hops, 0);
         assert_eq!(s.events_after(0, 10).unwrap().len(), 1, "old events kept");
@@ -838,7 +1313,7 @@ mod tests {
     #[test]
     fn discovered_pages_commit_with_the_outcome() {
         let mut s = Store::open_in_memory().unwrap();
-        let (r, _) = s.begin_run(&["src"]).unwrap();
+        let (r, _) = begin(&mut s);
         s.enqueue(r, &page("https://a.org/")).unwrap();
         let links = vec![
             page("https://a.org/1"),
@@ -846,7 +1321,7 @@ mod tests {
             page("https://a.org/1"),
         ];
         let (_, added) = s
-            .complete(r, "https://a.org/", None, content("h"), links)
+            .complete(r, "https://a.org/", None, content("h"), links, Vec::new())
             .unwrap();
         assert_eq!(
             added,
@@ -869,7 +1344,7 @@ mod tests {
     #[test]
     fn events_after_pages_through_ids() {
         let mut s = Store::open_in_memory().unwrap();
-        let (r, _) = s.begin_run(&["src"]).unwrap();
+        let (r, _) = begin(&mut s);
         for u in ["https://a.org/1", "https://a.org/2", "https://a.org/3"] {
             s.enqueue(r, &page(u)).unwrap();
             done(&mut s, r, u, content(u));

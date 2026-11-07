@@ -933,3 +933,115 @@ async fn tiktok_comment_cap_and_shell_pages() {
         "an empty shell is never fingerprinted as content"
     );
 }
+
+#[tokio::test]
+async fn planned_runs_skip_pages_not_due_and_refetch_comments_only_on_change() {
+    use rayap_core::Plan;
+    use rayap_core::revisit::Prior;
+
+    let site = Site::default();
+    let post = include_str!("fixtures/tiktok/post.html");
+    site.set(
+        "/@tiktok/video/7106594312292453675",
+        Reply::Html(post.into()),
+    );
+    site.set(
+        "/api/comment/list/?aid=1988&aweme_id=7106594312292453675&count=20&cursor=0",
+        Reply::Text(include_str!("fixtures/tiktok/comments.json").into()),
+    );
+    site.set(
+        "/@x/video/1",
+        Reply::Html(include_str!("fixtures/tiktok/post-gone.html").into()),
+    );
+    let addr = start(site.clone()).await;
+    let cfg = tiktok_config(addr, 20);
+    let plan = Plan {
+        budget: 1,
+        max_interval_days: 30.0,
+        prior: Prior {
+            rate: 0.2,
+            weight: 0.5,
+        },
+    };
+    let planned = || Options {
+        plan: Some(plan.clone()),
+        ..Options::default()
+    };
+    let mut store = Store::open_in_memory().unwrap();
+
+    // Run 1, planned: both seeds are unknown, so both are fetched regardless of the budget.
+    let (stats, events) = run(&cfg, &mut store, planned()).await;
+    assert_eq!(
+        (stats.deferred, events.len()),
+        (0, 3),
+        "{:?}",
+        kinds(&events)
+    );
+
+    // Run 2, planned, budget 1: one of the two known pages is deferred. The visited post is
+    // unchanged, so its comment page is not fetched again.
+    let before = site.requests().len();
+    let (stats, events) = run(&cfg, &mut store, planned()).await;
+    assert_eq!(stats.deferred, 1);
+    assert_eq!(events.len(), 1, "{:?}", kinds(&events));
+    let new_requests: Vec<String> = site.requests()[before..]
+        .iter()
+        .filter(|p| !p.ends_with("/robots.txt"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        new_requests.len(),
+        1,
+        "one page request besides robots.txt: {new_requests:?}"
+    );
+    assert!(matches!(
+        events[0].kind,
+        EventKind::Unchanged | EventKind::Gone
+    ));
+
+    // Edit the post, then give the budget to both pages: the post is changed, and only then
+    // is its comment page refetched.
+    site.set(
+        "/@tiktok/video/7106594312292453675",
+        Reply::Html(post.replace("how many frogs", "how many toads")),
+    );
+    let before = site.requests().len();
+    let (_, events) = run(
+        &cfg,
+        &mut store,
+        Options {
+            plan: Some(Plan {
+                budget: 2,
+                ..plan.clone()
+            }),
+            ..Options::default()
+        },
+    )
+    .await;
+    let post_event = events
+        .iter()
+        .find(|e| e.url.contains("/video/7106"))
+        .unwrap();
+    assert_eq!(post_event.kind, EventKind::Changed);
+    let new_requests = &site.requests()[before..];
+    assert!(
+        new_requests
+            .iter()
+            .any(|p| p.contains("/api/comment/list/")),
+        "comments refetched after a change: {new_requests:?}"
+    );
+    assert_eq!(
+        store.records_after(0, Some("comment"), 100).unwrap().len(),
+        3,
+        "replaced, not duplicated"
+    );
+
+    // The planner has seen two revisits of the post (one unchanged, one changed) and reports a rate.
+    let rates = store.rates("frogs", plan.prior).unwrap();
+    assert_eq!(
+        rates.len(),
+        1,
+        "continuation pages are not planned: {rates:?}"
+    );
+    assert!(rates[0].1 > 0.0);
+}

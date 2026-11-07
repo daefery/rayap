@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use rayap_core::{Config, Event, EventKind, Options, Record, Store, crawl};
+use rayap_core::revisit::Prior;
+use rayap_core::{Config, Event, EventKind, Options, Plan, Record, Store, crawl};
 
 #[derive(Parser)]
 #[command(
@@ -34,6 +35,20 @@ enum Command {
         /// Stop after this many page requests (the next run resumes).
         #[arg(long)]
         max_fetches: Option<u64>,
+        /// Revisit only this many known pages, the ones most due by their learned change
+        /// rate, plus every page never fetched. Without it every known page is visited.
+        #[arg(long)]
+        budget: Option<usize>,
+        /// With --budget: visit every page at least this often, however rarely it changes.
+        #[arg(long, default_value_t = 30.0)]
+        max_interval_days: f64,
+    },
+    /// Print each known page's learned change rate (per day), as JSON lines.
+    Rates {
+        #[arg(short, long, default_value = "rayap.toml")]
+        config: PathBuf,
+        #[arg(long, default_value = "rayap.db")]
+        db: PathBuf,
     },
     /// Print stored events with an id greater than AFTER, as JSON lines.
     Events {
@@ -109,21 +124,48 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Rates { config, db } => {
+            let config = load(&config)?;
+            let store = Store::open(&db).map_err(|e| e.to_string())?;
+            let mut out = io::stdout().lock();
+            for source in &config.sources {
+                for (url, rate) in store
+                    .rates(&source.name, DEFAULT_PRIOR)
+                    .map_err(|e| e.to_string())?
+                {
+                    let line = serde_json::json!({
+                        "source": source.name,
+                        "url": url,
+                        "changes_per_day": rate,
+                    });
+                    writeln!(out, "{line}").map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Crawl {
             config,
             db,
             changes_only,
             max_fetches,
+            budget,
+            max_interval_days,
         } => {
             let config = load(&config)?;
             let mut store = Store::open(&db).map_err(|e| e.to_string())?;
             let mut out = io::stdout().lock();
             let mut write_error = None;
+            let plan = budget.map(|budget| Plan {
+                budget,
+                max_interval_days,
+                prior: DEFAULT_PRIOR,
+            });
             let stats = crawl(
                 &config,
                 &mut store,
                 Options {
                     max_fetches,
+                    plan,
                     ..Options::default()
                 },
                 |event| {
@@ -140,13 +182,18 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
                 return Err(e);
             }
             eprintln!(
-                "rayap: run {}{}: {} requests, {} events, {} changed, {} bytes{}",
+                "rayap: run {}{}: {} requests, {} events, {} changed, {} bytes{}{}",
                 stats.run,
                 if stats.resumed { " (resumed)" } else { "" },
                 stats.requests,
                 stats.events,
                 stats.changed,
                 stats.bytes,
+                if stats.deferred > 0 {
+                    format!(", {} pages deferred by the budget", stats.deferred)
+                } else {
+                    String::new()
+                },
                 if stats.finished {
                     ""
                 } else {
@@ -157,6 +204,13 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
         }
     }
 }
+
+/// Before any revisit shows a change, a page is assumed to change about once in five days,
+/// held weakly (half an observation) so real visits take over quickly.
+const DEFAULT_PRIOR: Prior = Prior {
+    rate: 0.2,
+    weight: 0.5,
+};
 
 fn load(path: &PathBuf) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;

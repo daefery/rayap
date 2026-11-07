@@ -23,7 +23,7 @@ use crate::config::SourceKind;
 use crate::fetch::{self, Clients, Extractor, PageResult, RobotsResult};
 use crate::frontier::{Frontier, Next};
 use crate::robots::{self, Rules};
-use crate::store::{Event, EventKind, NewPage, Outcome, Store, unix_now_ms};
+use crate::store::{Event, EventKind, NewPage, Outcome, Plan, Store, unix_now_ms};
 use crate::{Config, Error, Result, tiktok, urlnorm};
 
 /// Delay used for 429/503 without a usable Retry-After.
@@ -49,6 +49,9 @@ pub struct Options {
     pub resolver: Option<Arc<dyn reqwest::dns::Resolve>>,
     /// Running total of coordinator busy time in microseconds, for live sampling.
     pub busy_micros: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Visit only the pages most due by learned change rate (plus never-fetched ones),
+    /// instead of every known page. Ignored when resuming an unfinished run.
+    pub plan: Option<Plan>,
 }
 
 impl std::fmt::Debug for Options {
@@ -57,6 +60,7 @@ impl std::fmt::Debug for Options {
             .field("max_fetches", &self.max_fetches)
             .field("resolver", &self.resolver.as_ref().map(|_| "custom"))
             .field("busy_micros", &self.busy_micros.is_some())
+            .field("plan", &self.plan)
             .finish()
     }
 }
@@ -71,6 +75,8 @@ pub struct Stats {
     pub bytes: u64,
     /// True when every queued page got an outcome and the run was closed.
     pub finished: bool,
+    /// Known pages the plan left for a later run.
+    pub deferred: u64,
     /// Time the coordinator spent working (scheduling and recording), as opposed to waiting.
     /// Close to the run's wall time means the coordinator is the bottleneck.
     pub coordinator_busy: Duration,
@@ -177,7 +183,8 @@ pub async fn crawl<F: FnMut(&Event)>(
 ) -> Result<Stats> {
     let clients = Arc::new(Clients::new(config, options.resolver.clone())?);
     let sources: Vec<&str> = config.sources.iter().map(|s| s.name.as_str()).collect();
-    let (run, resumed) = store.begin_run(&sources)?;
+    let start = store.begin_run(&sources, options.plan.as_ref())?;
+    let (run, resumed) = (start.run, start.resumed);
     let mut seed_hosts = HashMap::new();
     let mut extractors = HashMap::new();
     for source in &config.sources {
@@ -192,15 +199,19 @@ pub async fn crawl<F: FnMut(&Event)>(
             },
         };
         extractors.insert(source.name.clone(), extractor);
-        store.enqueue(
-            run,
-            &NewPage {
-                url: url.to_string(),
-                source: source.name.clone(),
-                depth: 0,
-                hops: 0,
-            },
-        )?;
+        let seed = NewPage {
+            url: url.to_string(),
+            source: source.name.clone(),
+            depth: 0,
+            hops: 0,
+            continuation: false,
+        };
+        if options.plan.is_some() {
+            // The plan decides when a known seed is due; only new seeds are forced in.
+            store.enqueue_if_unknown(run, &seed)?;
+        } else {
+            store.enqueue(run, &seed)?;
+        }
     }
     let mut crawler = Crawler {
         config,
@@ -217,6 +228,7 @@ pub async fn crawl<F: FnMut(&Event)>(
         stats: Stats {
             run,
             resumed,
+            deferred: start.deferred,
             ..Stats::default()
         },
         on_event,
@@ -658,15 +670,20 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                     detail: None,
                     records,
                 };
-                let mut discovered = self.links_to_follow(&page, links);
-                // Continuation pages are part of this page, not links: same depth, no limit.
-                discovered.extend(next.into_iter().map(|u| NewPage {
-                    url: u.to_string(),
-                    source: page.source.clone(),
-                    depth: page.depth,
-                    hops: 0,
-                }));
-                self.commit(&page.url, None, outcome, discovered)?;
+                let discovered = self.links_to_follow(&page, links);
+                // Continuation pages are part of this page, not links: same depth, no depth
+                // limit, and fetched only when this page is new or changed.
+                let continuation = next
+                    .into_iter()
+                    .map(|u| NewPage {
+                        url: u.to_string(),
+                        source: page.source.clone(),
+                        depth: page.depth,
+                        hops: 0,
+                        continuation: true,
+                    })
+                    .collect();
+                self.commit_with(&page.url, None, outcome, discovered, continuation)?;
                 Ok(delay)
             }
             PageResult::Invalid {
@@ -701,6 +718,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                             source: page.source.clone(),
                             depth: page.depth,
                             hops: page.hops + 1,
+                            continuation: false,
                         };
                         (EventKind::Redirect, target.to_string(), vec![next])
                     }
@@ -851,6 +869,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 source: parent.source.clone(),
                 depth: parent.depth + 1,
                 hops: 0,
+                continuation: false,
             })
             .collect()
     }
@@ -864,9 +883,20 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         outcome: Outcome,
         discovered: Vec<NewPage>,
     ) -> Result<()> {
-        let (event, added) = self
-            .store
-            .complete(self.run, url, kind, outcome, discovered)?;
+        self.commit_with(url, kind, outcome, discovered, Vec::new())
+    }
+
+    fn commit_with(
+        &mut self,
+        url: &str,
+        kind: Option<EventKind>,
+        outcome: Outcome,
+        discovered: Vec<NewPage>,
+        continuation: Vec<NewPage>,
+    ) -> Result<()> {
+        let (event, added) =
+            self.store
+                .complete(self.run, url, kind, outcome, discovered, continuation)?;
         let now = Instant::now();
         for p in added {
             let Ok(parsed) = Url::parse(&p.url) else {
