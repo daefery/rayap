@@ -671,7 +671,9 @@ fn migrate(tx: &Transaction) -> Result<()> {
             tx.execute_batch("ALTER TABLE events ADD COLUMN records INTEGER")?;
         }
     }
-    if has_pages && version < 5 {
+    // Columns added by schema 5. Checked whenever `pages` exists, not only below version 5,
+    // so a database stamped 5 by an earlier build of this version is still completed.
+    if has_pages {
         for (column, definition) in [
             ("content_at", "INTEGER"),
             ("continuation", "INTEGER NOT NULL DEFAULT 0"),
@@ -688,6 +690,8 @@ fn migrate(tx: &Transaction) -> Result<()> {
                 ))?;
             }
         }
+    }
+    if has_pages && version < 5 {
         // Pages fetched before this version: their last content fetch is their last fetch,
         // and TikTok comment pages (the only continuation pages so far) are marked as such.
         tx.execute_batch(
