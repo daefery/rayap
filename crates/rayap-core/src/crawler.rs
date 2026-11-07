@@ -35,6 +35,9 @@ const CHALLENGE_HOLD: Duration = Duration::from_secs(5 * 60);
 const MAX_ROBOTS_HOPS: u32 = 5;
 /// Redirects followed from one source URL before the chain is reported as an error.
 const MAX_PAGE_HOPS: u32 = 10;
+/// Responses recorded per transaction at most. Bounds how much work a crash can undo and
+/// how long events wait before delivery.
+const MAX_BATCH: usize = 512;
 /// In-memory stand-in for a hold too far away to add to the clock. The stored deadline is
 /// kept exact; this only decides that the host is not contacted in this run.
 const FAR_FUTURE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
@@ -174,6 +177,8 @@ struct Crawler<'a, F: FnMut(&Event)> {
     in_flight: usize,
     stats: Stats,
     on_event: F,
+    /// Events of the batch being recorded, delivered once it is committed.
+    pending_events: Vec<Event>,
 }
 
 /// Crawls every configured source once, resuming an unfinished run if there is one.
@@ -228,6 +233,7 @@ pub async fn crawl<F: FnMut(&Event)>(
         seed_hosts,
         extractors,
         in_flight: 0,
+        pending_events: Vec::new(),
         stats: Stats {
             run,
             resumed,
@@ -325,6 +331,8 @@ pub async fn crawl<F: FnMut(&Event)>(
                 Step::Again => {}
             }
         }
+        // Pages settled without a request (robots.txt blocks) were committed one by one.
+        crawler.deliver_events();
 
         let too_far = wake.is_some_and(|at| at > Instant::now() + config.max_wait());
         if crawler.in_flight == 0
@@ -346,14 +354,20 @@ pub async fn crawl<F: FnMut(&Event)>(
         tokio::select! {
             Some(done) = rx.recv() => {
                 let started = Instant::now();
+                // Everything that has finished is recorded in one transaction and one
+                // scheduling pass. Events are delivered only after the commit, so a consumer
+                // never sees an outcome that a crash could roll back.
+                crawler.store.begin_batch()?;
                 crawler.in_flight -= 1;
                 crawler.handle(done)?;
-                // Drain whatever else has finished before scheduling again, so a busy
-                // coordinator makes one scheduling pass per batch rather than per response.
-                while let Ok(done) = rx.try_recv() {
+                let mut batched = 1;
+                while batched < MAX_BATCH && let Ok(done) = rx.try_recv() {
                     crawler.in_flight -= 1;
                     crawler.handle(done)?;
+                    batched += 1;
                 }
+                crawler.store.end_batch()?;
+                crawler.deliver_events();
                 let busy = started.elapsed();
                 crawler.stats.coordinator_busy += busy;
                 if let Some(counter) = &options.busy_micros {
@@ -952,7 +966,14 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         if matches!(event.kind, EventKind::Changed) {
             self.stats.changed += 1;
         }
-        (self.on_event)(&event);
+        self.pending_events.push(event);
         Ok(())
+    }
+
+    /// Hands the committed batch's events to the consumer, in commit order.
+    fn deliver_events(&mut self) {
+        for event in self.pending_events.drain(..) {
+            (self.on_event)(&event);
+        }
     }
 }

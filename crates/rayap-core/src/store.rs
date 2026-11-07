@@ -278,6 +278,7 @@ pub struct Outcome {
 
 pub struct Store {
     conn: Connection,
+    in_batch: bool,
 }
 
 pub fn unix_now() -> i64 {
@@ -305,7 +306,10 @@ impl Store {
         let tx = conn.transaction()?;
         migrate(&tx)?;
         tx.commit()?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            in_batch: false,
+        })
     }
 
     /// Returns the unfinished run if there is one (resume), otherwise starts a new run and
@@ -355,6 +359,28 @@ impl Store {
             resumed: false,
             deferred,
         })
+    }
+
+    /// Starts a batch: every write until `end_batch` lands in one transaction. Used by the
+    /// coordinator to commit all responses it drained in one pass together, which costs one
+    /// commit instead of one per page. Writes are visible to this connection immediately,
+    /// durable only after `end_batch`; a crash before that re-fetches the batch (at-least-once,
+    /// as before). Holds written in the batch are lost too, which is safe: a restart contacts
+    /// no host earlier than the last committed hold, and the delay is re-applied on fetch.
+    pub fn begin_batch(&mut self) -> Result<()> {
+        if !self.in_batch {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            self.in_batch = true;
+        }
+        Ok(())
+    }
+
+    pub fn end_batch(&mut self) -> Result<()> {
+        if self.in_batch {
+            self.in_batch = false;
+            self.conn.execute_batch("COMMIT")?;
+        }
+        Ok(())
     }
 
     /// Adds a page to run `run` only if it is not known at all. Returns true if it was added.
@@ -430,18 +456,23 @@ impl Store {
         discovered: Vec<NewPage>,
         continuation: Vec<NewPage>,
     ) -> Result<(Event, Vec<NewPage>)> {
-        let tx = self.conn.transaction()?;
-        let (event, activity_changed) = complete_in(&tx, run, url, kind, outcome)?;
-        let mut added = Vec::new();
-        let follow = matches!(event.kind, EventKind::New | EventKind::Changed) || activity_changed;
-        let continuation = if follow { continuation } else { Vec::new() };
-        for page in discovered.into_iter().chain(continuation) {
-            if enqueue_in(&tx, run, &page)? {
-                added.push(page);
-            }
+        if self.in_batch {
+            // Inside a batch the enclosing transaction provides atomicity; a savepoint
+            // would only add cost.
+            return complete_with(
+                &self.conn,
+                run,
+                url,
+                kind,
+                outcome,
+                discovered,
+                continuation,
+            );
         }
+        let tx = self.conn.transaction()?;
+        let result = complete_with(&tx, run, url, kind, outcome, discovered, continuation)?;
         tx.commit()?;
-        Ok((event, added))
+        Ok(result)
     }
 
     /// Learned change rate (per day) of each known page of `source`, for inspection.
@@ -832,6 +863,27 @@ fn migrate(tx: &Transaction) -> Result<()> {
     Ok(())
 }
 
+fn complete_with(
+    conn: &Connection,
+    run: i64,
+    url: &str,
+    kind: Option<EventKind>,
+    outcome: Outcome,
+    discovered: Vec<NewPage>,
+    continuation: Vec<NewPage>,
+) -> Result<(Event, Vec<NewPage>)> {
+    let (event, activity_changed) = complete_in(conn, run, url, kind, outcome)?;
+    let mut added = Vec::new();
+    let follow = matches!(event.kind, EventKind::New | EventKind::Changed) || activity_changed;
+    let continuation = if follow { continuation } else { Vec::new() };
+    for page in discovered.into_iter().chain(continuation) {
+        if enqueue_in(conn, run, &page)? {
+            added.push(page);
+        }
+    }
+    Ok((event, added))
+}
+
 fn enqueue_in(conn: &Connection, run: i64, page: &NewPage) -> Result<bool> {
     let changed = conn
         .prepare_cached(
@@ -854,7 +906,7 @@ fn enqueue_in(conn: &Connection, run: i64, page: &NewPage) -> Result<bool> {
 }
 
 fn complete_in(
-    tx: &Transaction,
+    tx: &Connection,
     run: i64,
     url: &str,
     kind: Option<EventKind>,
@@ -1459,6 +1511,46 @@ mod tests {
         assert_eq!(fingerprint_version("v12:x"), "v12");
         assert_eq!(fingerprint_version("deadbeef"), "v1");
         assert_eq!(fingerprint_version("not:a:version"), "v1");
+    }
+
+    #[test]
+    fn a_batch_commits_everything_at_once_and_a_dropped_batch_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.db");
+        {
+            let mut s = Store::open(&path).unwrap();
+            let (r, _) = begin(&mut s);
+            for u in ["https://a.org/1", "https://a.org/2", "https://a.org/3"] {
+                s.enqueue(r, &page(u)).unwrap();
+            }
+            s.begin_batch().unwrap();
+            done(&mut s, r, "https://a.org/1", content("h1"));
+            done(&mut s, r, "https://a.org/2", content("h2"));
+            s.end_batch().unwrap();
+            // A third outcome is recorded but the process stops before end_batch.
+            s.begin_batch().unwrap();
+            done(&mut s, r, "https://a.org/3", content("h3"));
+            s.hold_host("a.org", unix_now_ms() + 60_000).unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        let start = s.begin_run(&["src"], None).unwrap();
+        assert!(start.resumed);
+        let pending: Vec<String> = s
+            .pending(start.run)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.url)
+            .collect();
+        assert_eq!(
+            pending,
+            ["https://a.org/3"],
+            "the committed batch stuck; the open one rolled back"
+        );
+        assert_eq!(s.events_after(0, 10).unwrap().len(), 2);
+        assert!(
+            s.active_holds().unwrap().is_empty(),
+            "the uncommitted hold is gone too"
+        );
     }
 
     #[test]
