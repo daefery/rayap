@@ -148,6 +148,33 @@ In the new profile (`flamegraph-after.svg`), entity decoding is 0.8% of samples 
 Whitespace collapsing (31%) is still the largest single cost there, and the next thing to
 make cheaper.
 
+### A second optimisation: batched commits (7 Nov 2026)
+
+"What breaks first" below names the single coordinator, which committed one SQLite
+transaction per page outcome. Commit `74ef4bb` opens one transaction before the
+coordinator drains the responses that have finished, records up to 512 of them, commits
+once, and only then hands their events to the consumer. Semantics are unchanged: a crash
+before the commit refetches the batch (at-least-once, as before), and a consumer never sees
+an event that a crash could roll back.
+
+Three before/after pairs, alternating, same simulator and referee, 10,000 hosts, 8,192 in
+flight, medians (files in [`results/2026-11-07/`](results/2026-11-07/),
+`batch-before-eb2db7a-run*` and `batch-after-run*`):
+
+| | before (`eb2db7a`) | after (`74ef4bb`) | |
+|---|---|---|---|
+| Steady-window pages/s | 1,433 | 2,086 | **1.46x** |
+| Whole-run pages/s | 956 | 1,338 | 1.40x |
+| Seconds to 90% of pages | 309 | 195 | 0.63x |
+| Crawler CPU seconds | 325 | 318 | 0.98x |
+| Peak memory | 1,567 MiB | 1,676 MiB | 1.07x |
+| Politeness violations (proven) | 0 / 0 / 0 | 0 / 0 / 0 | |
+
+These absolute rates are lower than the 6 Nov runs above because the laptop was busier
+(load average 1.4–3.2, other sessions running); only the ratio is like for like. The
+coordinator is still busy 100% of the steady window after the change, so the next step is
+still the one named below: several coordinators sharded by host.
+
 ### Scaling with host count (one run each, 8,192 in flight)
 
 | Hosts | Politeness cap | Steady pages/s | % of cap | Steady window | Coordinator busy (est.) | Steady CPU cores | Whole-run pages/s | Peak memory | Violations (proven / uncertain) |

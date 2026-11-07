@@ -29,7 +29,7 @@ set 10 ms too fast 92,057 times in the same crawl.
 internet. [bench/README.md](bench/README.md) has:
 - the setup and every raw result with its command;
 - negative controls;
-- a before/after optimisation;
+- two before/after optimisations (extraction off the coordinator; batched commits, 1.46x);
 - a scaling table showing where one coordinator stops scaling (about 20,000 hosts);
 - the limits.
 
@@ -216,8 +216,8 @@ forbid automated collection, so keep volume low and use it only where you have t
 1. Measure new comments per KB: planned vs visit-everything revisits a day apart on posts
    that still receive comments (the planner and the activity-gated comment pages are in;
    the windows tried so far had no new comments in either arm).
-2. Batched commits and several coordinators sharded by host, to scale past one
-   coordinator (see "What breaks first" in the benchmark).
+2. Several coordinators sharded by host, to scale past one coordinator (batched commits
+   are in; see "What breaks first" in the benchmark).
 3. Conditional requests (`If-None-Match`, `If-Modified-Since`). Deferred: of the 7 real
    sources in `examples/` and `bench/tiktok`, checked 7 Nov 2026, only one
    (andpurpose.world) sends a validator and answers 304; the rest send neither `ETag` nor
