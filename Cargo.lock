@@ -1603,8 +1603,10 @@ dependencies = [
 name = "rayap-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "rayap-core",
+ "rayap-serve",
  "serde_json",
  "tokio",
 ]
@@ -1626,6 +1628,19 @@ dependencies = [
  "tokio",
  "toml",
  "url",
+]
+
+[[package]]
+name = "rayap-serve"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "rayap-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

@@ -109,6 +109,24 @@ An event:
 
 `id` only increases, so a consumer can store the last id it processed and read on from there.
 
+### Dashboard
+
+```sh
+./target/release/rayap serve --db grants=grants.db --db tiktok=tiktok.db
+# http://127.0.0.1:8732/
+```
+
+One read-only page over any number of crawl databases, each a *collection* (`grants`,
+`tiktok`, anything you crawl next). Three views per collection, searchable: **Pages** (every
+known page, its last outcome, when it was fetched, how often it changed), **Records** (what
+was extracted: the visible text of each page, TikTok posts and comments; filter by kind,
+search the text), **Events** (the change log). The same data as JSON:
+`/api/collections`, `/api/{c}/pages?q=`, `/api/{c}/records?q=&kind=`, `/api/{c}/events?after=`.
+The server only reads; `rayap crawl` can write to the same file meanwhile.
+
+Every HTML page's visible text is stored as a `page` record (up to 200 KB, marked
+`truncated` beyond that), so a `changed` event can be read, not only noticed.
+
 ### Watching grant pages
 
 `examples/ai-oss-grants.toml` lists 23 public pages of funders that give grants to AI and
@@ -189,6 +207,7 @@ forbid automated collection, so keep volume low and use it only where you have t
 | `crates/rayap-core/src/tiktok.rs` | TikTok post and comment pages into `post` / `comment` records |
 | `crates/rayap-core/tests/crawl.rs` | end-to-end tests against a local server |
 | `crates/rayap-cli` | the `rayap` command |
+| `crates/rayap-serve` | `rayap serve`: read-only JSON API and the one-file dashboard |
 | `crates/rayap-sim` | simulated web plus an independent politeness referee |
 | `crates/rayap-bench` | end-to-end and scheduler-only benchmarks, with flamegraphs |
 

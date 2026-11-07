@@ -1,0 +1,19 @@
+[package]
+name = "rayap-serve"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read-only HTTP API and dashboard over rayap databases"
+
+[dependencies]
+axum = "0.8.9"
+rayap-core = { version = "0.1.0", path = "../rayap-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1.54.1", features = ["full"] }

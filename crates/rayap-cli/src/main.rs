@@ -76,6 +76,31 @@ enum Command {
         #[arg(short, long, default_value = "rayap.toml")]
         config: PathBuf,
     },
+    /// Serve a read-only dashboard and JSON API over one or more crawl databases.
+    Serve {
+        /// A collection as `name=path/to.db`; repeat for several (e.g. grants=grants.db).
+        #[arg(long = "db", required = true, value_parser = parse_collection)]
+        collections: Vec<(String, PathBuf)>,
+        #[arg(long, default_value = "127.0.0.1:8732")]
+        listen: String,
+    },
+}
+
+fn parse_collection(s: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("'{s}': expected name=path"))?;
+    let name = name.trim();
+    let ok = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        return Err(format!(
+            "'{name}': collection names use letters, digits, '-' and '_'"
+        ));
+    }
+    Ok((name.to_string(), PathBuf::from(path.trim())))
 }
 
 #[tokio::main]
@@ -122,6 +147,27 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
             {
                 write_record(&mut out, &record)?;
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Serve {
+            collections,
+            listen,
+        } => {
+            let names: Vec<String> = collections
+                .iter()
+                .map(|(n, p)| format!("{n} ({})", p.display()))
+                .collect();
+            let app = rayap_serve::router(rayap_serve::Collections::new(collections));
+            let listener = tokio::net::TcpListener::bind(&listen)
+                .await
+                .map_err(|e| format!("{listen}: {e}"))?;
+            eprintln!(
+                "rayap: serving {} at http://{listen}/ (read-only; ctrl-c to stop)",
+                names.join(", ")
+            );
+            axum::serve(listener, app)
+                .await
+                .map_err(|e| e.to_string())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Rates { config, db } => {

@@ -127,16 +127,16 @@ pub async fn fetch_page(
             match read_limited(response, max_body).await {
                 Ok(Some(body)) => match extractor {
                     Extractor::Page { product_token } => {
-                        let (title, hash, links) = digest(&body, is_html, url, product_token);
+                        let digested = digest(&body, is_html, url, product_token);
                         PageResult::Body {
                             status,
                             bytes: body.len(),
-                            title,
-                            hash,
-                            links,
+                            title: digested.title,
+                            hash: digested.hash,
+                            links: digested.links,
                             next: Vec::new(),
                             activity: None,
-                            records: Vec::new(),
+                            records: digested.record.into_iter().collect(),
                             etag,
                             last_modified,
                         }
@@ -223,22 +223,58 @@ pub async fn fetch_robots(clients: &Clients, url: &str) -> RobotsResult {
     }
 }
 
-/// Title, content fingerprint and links of a fetched body.
-fn digest(
-    body: &[u8],
-    is_html: bool,
-    url: &Url,
-    product_token: &str,
-) -> (Option<String>, String, Vec<Url>) {
-    if is_html {
-        let text = String::from_utf8_lossy(body);
-        let extract = html::extract(&text, url, product_token);
-        let hash = blake3::hash(&extract.fingerprint_source())
-            .to_hex()
-            .to_string();
-        (extract.title, hash, extract.links)
-    } else {
-        (None, blake3::hash(body).to_hex().to_string(), Vec::new())
+struct Digested {
+    title: Option<String>,
+    hash: String,
+    links: Vec<Url>,
+    /// The page's visible text as a `page` record, so what changed can be read later.
+    record: Option<NewRecord>,
+}
+
+/// Visible text kept per page record. Enough for a grant call or a news page; a longer
+/// page is cut at a character boundary and marked `truncated`.
+const MAX_PAGE_TEXT: usize = 200 * 1024;
+
+/// Title, content fingerprint, links and the text record of a fetched body.
+fn digest(body: &[u8], is_html: bool, url: &Url, product_token: &str) -> Digested {
+    if !is_html {
+        return Digested {
+            title: None,
+            hash: blake3::hash(body).to_hex().to_string(),
+            links: Vec::new(),
+            record: None,
+        };
+    }
+    let text = String::from_utf8_lossy(body);
+    let extract = html::extract(&text, url, product_token);
+    let hash = blake3::hash(&extract.fingerprint_source())
+        .to_hex()
+        .to_string();
+    let mut visible = extract.text;
+    let truncated = visible.len() > MAX_PAGE_TEXT;
+    if truncated {
+        let mut cut = MAX_PAGE_TEXT;
+        while !visible.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        visible.truncate(cut);
+    }
+    let record = NewRecord {
+        kind: "page".into(),
+        key: url.to_string(),
+        data: serde_json::json!({
+            "url": url.as_str(),
+            "title": extract.title,
+            "text": visible,
+            "chars": visible.chars().count(),
+            "truncated": truncated,
+        }),
+    };
+    Digested {
+        title: extract.title,
+        hash,
+        links: extract.links,
+        record: Some(record),
     }
 }
 

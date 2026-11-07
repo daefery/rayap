@@ -20,7 +20,7 @@ pub mod urlnorm;
 
 pub use config::{Config, SourceKind};
 pub use crawler::{Options, Stats, crawl};
-pub use store::{Event, EventKind, Plan, Record, Store};
+pub use store::{Event, EventKind, PageView, Plan, Record, Store, Summary};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

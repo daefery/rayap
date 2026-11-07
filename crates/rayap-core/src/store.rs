@@ -169,6 +169,33 @@ pub struct NewRecord {
     pub data: serde_json::Value,
 }
 
+/// One known page with its latest state, for `rayap serve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PageView {
+    pub url: String,
+    pub source: String,
+    pub title: Option<String>,
+    pub status: Option<u16>,
+    pub fetched_at: Option<i64>,
+    pub content_at: Option<i64>,
+    pub has_content: bool,
+    pub last_kind: Option<String>,
+    pub last_detail: Option<String>,
+    /// `changed` events seen for this page.
+    pub changes: i64,
+    pub records: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Summary {
+    pub pages: i64,
+    pub pages_with_content: i64,
+    pub runs: i64,
+    pub last_run_at: Option<i64>,
+    pub events: i64,
+    pub record_kinds: Vec<(String, i64)>,
+}
+
 /// A stored record, as `rayap records` prints it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Record {
@@ -478,6 +505,93 @@ impl Store {
         let mut stmt = self.conn.prepare("SELECT host, until_ms FROM host_holds")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Read-only view for dashboards: every known non-continuation page with its latest state.
+    pub fn pages(&self, query: Option<&str>) -> Result<Vec<PageView>> {
+        let like = query.map(|q| format!("%{}%", q.trim()));
+        let mut stmt = self.conn.prepare(
+            "SELECT p.url, p.source, p.title, p.status, p.fetched_at, p.content_at, p.content_hash,
+                    (SELECT kind FROM events e WHERE e.url = p.url ORDER BY e.id DESC LIMIT 1),
+                    (SELECT detail FROM events e WHERE e.url = p.url ORDER BY e.id DESC LIMIT 1),
+                    (SELECT count(*) FROM events e WHERE e.url = p.url AND e.kind = 'changed'),
+                    (SELECT count(*) FROM records r WHERE r.url = p.url)
+             FROM pages p WHERE p.continuation = 0
+               AND (?1 IS NULL OR p.url LIKE ?1 OR p.source LIKE ?1 OR coalesce(p.title, '') LIKE ?1)
+             ORDER BY p.source, p.rowid",
+        )?;
+        let rows = stmt.query_map([like], |r| {
+            Ok(PageView {
+                url: r.get(0)?,
+                source: r.get(1)?,
+                title: r.get(2)?,
+                status: r.get(3)?,
+                fetched_at: r.get(4)?,
+                content_at: r.get(5)?,
+                has_content: r.get::<_, Option<String>>(6)?.is_some(),
+                last_kind: r.get(7)?,
+                last_detail: r.get(8)?,
+                changes: r.get(9)?,
+                records: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Records whose kind, key or JSON text contains `query`, newest first.
+    pub fn search_records(
+        &self,
+        query: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Record>> {
+        let like = query.map(|q| format!("%{}%", q.trim()));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run, at, source, url, kind, key, data FROM records
+             WHERE (?1 IS NULL OR kind = ?1)
+               AND (?2 IS NULL OR data LIKE ?2 OR key LIKE ?2 OR source LIKE ?2)
+             ORDER BY at DESC, id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![kind, like, limit as i64], |r| {
+            let data: String = r.get(7)?;
+            Ok(Record {
+                id: r.get(0)?,
+                run: r.get(1)?,
+                at: r.get(2)?,
+                source: r.get(3)?,
+                url: r.get(4)?,
+                kind: r.get(5)?,
+                key: r.get(6)?,
+                data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Counts for a dashboard header.
+    pub fn summary(&self) -> Result<Summary> {
+        let one = |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
+        let mut kinds = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, count(*) FROM records GROUP BY kind ORDER BY kind")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            kinds.push(row?);
+        }
+        Ok(Summary {
+            pages: one("SELECT count(*) FROM pages WHERE continuation = 0")?,
+            pages_with_content: one(
+                "SELECT count(*) FROM pages WHERE continuation = 0 AND content_hash IS NOT NULL",
+            )?,
+            runs: one("SELECT count(*) FROM runs")?,
+            last_run_at: self
+                .conn
+                .query_row("SELECT max(started_at) FROM runs", [], |r| r.get(0))
+                .optional()?
+                .flatten(),
+            events: one("SELECT count(*) FROM events")?,
+            record_kinds: kinds,
+        })
     }
 
     /// Records with `id > after`, oldest first, optionally of one kind.

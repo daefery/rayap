@@ -152,8 +152,9 @@ fn collapse(s: &str) -> String {
 }
 
 /// Decodes the entities that commonly appear in titles and text, so that `&amp;` and `&`
-/// fingerprint the same. Other entities are kept as written. One pass; `&amp;lt;` becomes
-/// `&lt;` (decoded once), as a browser shows it.
+/// fingerprint the same: the named ones below and any numeric reference (`&#8211;`,
+/// `&#x2F;`). Other named entities are kept as written. One pass; `&amp;lt;` becomes `&lt;`
+/// (decoded once), as a browser shows it.
 fn decode_basic_entities(s: &str) -> String {
     const ENTITIES: [(&str, char); 6] = [
         ("&nbsp;", ' '),
@@ -176,14 +177,36 @@ fn decode_basic_entities(s: &str) -> String {
                 out.push(*ch);
                 rest = &rest[e.len()..];
             }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
+            None => match numeric_entity(rest) {
+                Some((ch, len)) => {
+                    out.push(ch);
+                    rest = &rest[len..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &rest[1..];
+                }
+            },
         }
     }
     out.push_str(rest);
     out
+}
+
+/// `&#NNN;` or `&#xHHH;` at the start of `s`: the character and the reference's length.
+fn numeric_entity(s: &str) -> Option<(char, usize)> {
+    let body = s.strip_prefix("&#")?;
+    let end = body.find(';')?;
+    if end == 0 || end > 8 {
+        return None;
+    }
+    let digits = &body[..end];
+    let code = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<u32>().ok()?,
+    };
+    let ch = char::from_u32(code).filter(|c| *c != '\0')?;
+    Some((ch, 2 + end + 1))
 }
 
 #[cfg(test)]
@@ -203,6 +226,10 @@ mod tests {
             <a href="call-1">again</a> <a href="mailto:x@example.org">mail</a></body></html>"#;
         let e = extract(html, &page(), "rayap");
         assert_eq!(e.title.as_deref(), Some("Open calls & deadlines"));
+        assert_eq!(
+            decode_basic_entities("Grants &#8211; Alpha &#x2F; Omega &#39;x&#39; &bogus; &#;"),
+            "Grants – Alpha / Omega 'x' &bogus; &#;"
+        );
         assert_eq!(
             e.text,
             "Grants Deadline: 1 Dec 2026 Call 1 About again mail"

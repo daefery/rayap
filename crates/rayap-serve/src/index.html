@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rayap</title>
+<style>
+  :root { --bg:#fbfbfa; --fg:#1b1b1b; --muted:#6b6b6b; --line:#e4e4e1; --accent:#0b57d0; --ok:#1b7f3b; --warn:#a15c00; --bad:#b3261e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--fg); background:var(--bg); }
+  header { display:flex; gap:16px; align-items:center; padding:12px 20px; border-bottom:1px solid var(--line); background:#fff; position:sticky; top:0; z-index:1; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0 12px 0 0; letter-spacing:.02em; }
+  header h1 span { color:var(--muted); font-weight:400; }
+  .tabs { display:flex; gap:4px; }
+  .tabs button { border:1px solid var(--line); background:#fff; padding:6px 12px; border-radius:6px; cursor:pointer; font:inherit; }
+  .tabs button.on { background:var(--fg); color:#fff; border-color:var(--fg); }
+  .views { display:flex; gap:4px; margin-left:auto; }
+  .views button { border:none; background:none; padding:6px 10px; cursor:pointer; font:inherit; color:var(--muted); border-bottom:2px solid transparent; }
+  .views button.on { color:var(--fg); border-bottom-color:var(--accent); }
+  input[type=search] { font:inherit; padding:6px 10px; border:1px solid var(--line); border-radius:6px; min-width:260px; }
+  select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  main { padding:16px 20px; max-width:1400px; }
+  .summary { color:var(--muted); margin:0 0 12px; display:flex; gap:18px; flex-wrap:wrap; }
+  .summary b { color:var(--fg); font-weight:600; }
+  table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-weight:600; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; background:#fafaf9; }
+  tr:last-child td { border-bottom:none; }
+  td.num { text-align:right; font-variant-numeric: tabular-nums; white-space:nowrap; }
+  td.time { white-space:nowrap; color:var(--muted); font-variant-numeric: tabular-nums; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  .url { color:var(--muted); font-size:12px; word-break:break-all; }
+  .k { display:inline-block; padding:1px 7px; border-radius:10px; font-size:12px; background:#eee; }
+  .k.new, .k.changed { background:#e3f2e8; color:var(--ok); }
+  .k.unchanged { background:#eee; color:var(--muted); }
+  .k.gone, .k.error, .k.blocked { background:#fdecea; color:var(--bad); }
+  .k.redirect { background:#fff3e0; color:var(--warn); }
+  .rec { font-size:13px; }
+  .rec .t { white-space:pre-wrap; }
+  .rec .meta { color:var(--muted); font-size:12px; margin-top:2px; }
+  .rec .excerpt { color:#333; margin-top:2px; }
+  .rec details { margin-top:4px; } .rec summary { cursor:pointer; } .rec .full { margin-top:6px; max-height:400px; overflow:auto; border-left:2px solid var(--line); padding-left:8px; }
+  .empty { color:var(--muted); padding:40px 0; text-align:center; }
+  .err { color:var(--bad); }
+  footer { color:var(--muted); font-size:12px; padding:12px 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>rayap <span>dashboard</span></h1>
+  <div class="tabs" id="tabs"></div>
+  <input type="search" id="q" placeholder="search title, url, source, record text…" autocomplete="off">
+  <select id="kind" title="record kind"><option value="">all records</option></select>
+  <div class="views">
+    <button data-view="pages" class="on">Pages</button>
+    <button data-view="records">Records</button>
+    <button data-view="events">Events</button>
+  </div>
+</header>
+<main>
+  <p class="summary" id="summary"></p>
+  <div id="out"></div>
+</main>
+<footer>Read-only view of the crawl databases. Run <code>rayap crawl</code> to update; reload to see it.</footer>
+<script>
+const $ = s => document.querySelector(s);
+const state = { collections: [], c: null, view: 'pages', q: '', kind: '' };
+const fmtTime = t => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 16) + 'Z' : '';
+const esc = s => String(s ?? '').replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+const kb = b => b == null ? '' : (b / 1024).toFixed(0) + ' KB';
+
+async function api(path) {
+  const r = await fetch(path);
+  const v = await r.json();
+  if (!r.ok) throw new Error(v.error || r.statusText);
+  return v;
+}
+
+async function loadCollections() {
+  state.collections = await api('/api/collections');
+  const tabs = $('#tabs'); tabs.innerHTML = '';
+  for (const c of state.collections) {
+    const b = document.createElement('button');
+    b.textContent = c.name; b.dataset.c = c.name;
+    b.onclick = () => { state.c = c.name; render(); };
+    tabs.appendChild(b);
+  }
+  const [fromHash, fromView] = location.hash.slice(1).split('/');
+  state.c = state.collections.some(c => c.name === fromHash) ? fromHash : (state.collections[0]?.name ?? null);
+  if (['pages', 'records', 'events'].includes(fromView)) state.view = fromView;
+}
+
+function summaryLine(c) {
+  const s = c?.summary;
+  if (!c) return '';
+  if (!s) return `<span class="err">no database yet (${esc(c.db)})</span>`;
+  if (s.error) return `<span class="err">${esc(s.error)}</span>`;
+  const kinds = (s.record_kinds || []).map(([k, n]) => `<b>${n}</b> ${esc(k)}`).join(' · ');
+  return `<span><b>${s.pages_with_content}</b> of <b>${s.pages}</b> pages with content</span>
+          <span><b>${s.runs}</b> runs, last ${fmtTime(s.last_run_at)}</span>
+          <span><b>${s.events}</b> events</span>${kinds ? `<span>${kinds}</span>` : ''}`;
+}
+
+function fillKinds(c) {
+  const sel = $('#kind'); const cur = state.kind;
+  sel.innerHTML = '<option value="">all records</option>';
+  for (const [k] of (c?.summary?.record_kinds || [])) {
+    const o = document.createElement('option'); o.value = k; o.textContent = k; sel.appendChild(o);
+  }
+  sel.value = [...sel.options].some(o => o.value === cur) ? cur : '';
+  state.kind = sel.value;
+  sel.style.display = state.view === 'records' ? '' : 'none';
+}
+
+async function render() {
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.c === state.c));
+  document.querySelectorAll('.views button').forEach(b => b.classList.toggle('on', b.dataset.view === state.view));
+  location.hash = state.c ? `${state.c}/${state.view}` : '';
+  const c = state.collections.find(x => x.name === state.c);
+  $('#summary').innerHTML = summaryLine(c);
+  fillKinds(c);
+  const out = $('#out');
+  if (!c || !c.summary || c.summary.error) { out.innerHTML = ''; return; }
+  out.innerHTML = '<p class="empty">loading…</p>';
+  try {
+    const q = encodeURIComponent(state.q);
+    if (state.view === 'pages') out.innerHTML = pagesTable(await api(`/api/${c.name}/pages?q=${q}`));
+    else if (state.view === 'records') out.innerHTML = recordsTable(await api(`/api/${c.name}/records?q=${q}&kind=${encodeURIComponent(state.kind)}&limit=500`));
+    else out.innerHTML = eventsTable(await api(`/api/${c.name}/events?limit=1000`));
+  } catch (e) { out.innerHTML = `<p class="empty err">${esc(e.message)}</p>`; }
+}
+
+function pagesTable(rows) {
+  if (!rows.length) return '<p class="empty">no pages match</p>';
+  return `<table><thead><tr><th>Source</th><th>Page</th><th>Last</th><th>Fetched</th><th>Changes</th><th>Records</th></tr></thead><tbody>` +
+    rows.map(p => `<tr>
+      <td>${esc(p.source)}</td>
+      <td>${p.title ? `<div>${esc(p.title)}</div>` : ''}<div class="url"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.url)}</a></div></td>
+      <td><span class="k ${esc(p.last_kind || '')}">${esc(p.last_kind || 'pending')}</span>${p.last_detail ? `<div class="url">${esc(p.last_detail)}</div>` : ''}</td>
+      <td class="time">${fmtTime(p.fetched_at)}</td>
+      <td class="num">${p.changes}</td>
+      <td class="num">${p.records || ''}</td>
+    </tr>`).join('') + '</tbody></table>';
+}
+
+function recordsTable(rows) {
+  if (!rows.length) return '<p class="empty">no records match</p>';
+  return `<table><thead><tr><th>Kind</th><th>Record</th><th>Source</th><th>Fetched</th></tr></thead><tbody>` +
+    rows.map(r => `<tr>
+      <td><span class="k">${esc(r.kind)}</span></td>
+      <td class="rec">${recordBody(r)}</td>
+      <td>${esc(r.source)}</td>
+      <td class="time">${fmtTime(r.at)}</td>
+    </tr>`).join('') + '</tbody></table>';
+}
+
+function recordBody(r) {
+  const d = r.data || {};
+  if (r.kind === 'page') return pageRecord(r, d);
+  const author = d.author?.handle ? `<b>@${esc(d.author.handle)}</b> ` : '';
+  const text = d.text != null ? `<div class="t">${author}${esc(d.text)}</div>` : `<pre class="t">${esc(JSON.stringify(d, null, 1))}</pre>`;
+  const meta = [];
+  if (d.stats) meta.push(`${d.stats.plays ?? '–'} plays · ${d.stats.likes ?? '–'} likes · ${d.stats.comments ?? '–'} comments`);
+  if (d.likes != null && !d.stats) meta.push(`${d.likes} likes${d.replies ? ` · ${d.replies} replies` : ''}`);
+  if (d.created_at) meta.push(`posted ${fmtTime(d.created_at)}`);
+  if (d.hashtags?.length) meta.push(d.hashtags.map(h => '#' + esc(h)).join(' '));
+  const link = d.url || r.url;
+  meta.push(`<a href="${esc(link)}" target="_blank" rel="noopener">${esc(r.key)}</a>`);
+  return text + `<div class="meta">${meta.join(' · ')}</div>`;
+}
+
+function pageRecord(r, d) {
+  const full = d.text || '';
+  const hit = state.q ? full.toLowerCase().indexOf(state.q.toLowerCase()) : -1;
+  const start = hit > 120 ? hit - 120 : 0;
+  const excerpt = (start ? '… ' : '') + full.slice(start, start + 600) + (full.length > start + 600 ? ' …' : '');
+  return `<div><b>${esc(d.title || r.key)}</b></div>
+    <div class="t excerpt">${esc(excerpt)}</div>
+    <details><summary class="meta">full text, ${d.chars} chars${d.truncated ? ' (truncated)' : ''}</summary><div class="t full">${esc(full)}</div></details>
+    <div class="meta"><a href="${esc(d.url || r.key)}" target="_blank" rel="noopener">${esc(d.url || r.key)}</a></div>`;
+}
+
+function eventsTable(rows) {
+  if (!rows.length) return '<p class="empty">no events yet</p>';
+  rows = rows.slice().reverse();
+  return `<table><thead><tr><th>#</th><th>When</th><th>Kind</th><th>Source</th><th>Page</th><th>Size</th><th>Records</th></tr></thead><tbody>` +
+    rows.map(e => `<tr>
+      <td class="num">${e.id}</td>
+      <td class="time">${fmtTime(e.at)}</td>
+      <td><span class="k ${esc(e.kind)}">${esc(e.kind)}</span></td>
+      <td>${esc(e.source)}</td>
+      <td>${e.title ? `<div>${esc(e.title)}</div>` : ''}<div class="url">${esc(e.url)}</div>${e.detail ? `<div class="url">${esc(e.detail)}</div>` : ''}</td>
+      <td class="num">${kb(e.bytes)}</td>
+      <td class="num">${e.records ?? ''}</td>
+    </tr>`).join('') + '</tbody></table>';
+}
+
+let timer;
+$('#q').addEventListener('input', e => { state.q = e.target.value; clearTimeout(timer); timer = setTimeout(render, 200); });
+$('#kind').addEventListener('change', e => { state.kind = e.target.value; render(); });
+document.querySelectorAll('.views button').forEach(b => b.onclick = () => { state.view = b.dataset.view; render(); });
+loadCollections().then(render).catch(e => { $('#out').innerHTML = `<p class="empty err">${esc(e.message)}</p>`; });
+</script>
+</body>
+</html>
