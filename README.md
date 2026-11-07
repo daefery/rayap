@@ -38,7 +38,7 @@ internet. [bench/README.md](bench/README.md) has:
 where changes happen. On 20,000 simulated pages with hidden change rates, one revisit per
 page per 5 days, 70% of pages static: changes caught per 1,000 fetches 137 → 219
 (**1.6x**; an oracle that knows the true rates gets 255), freshness 0.913 → 0.947 (oracle
-0.966), mean staleness 75 h → 29 h. The gain is 1.2x to 1.85x across the workloads tried,
+0.966), mean staleness 75 h → 28.5 h. The gain is 1.2x to 1.85x across the workloads tried,
 never an order of magnitude; the table and the reasons are in
 [bench/README.md](bench/README.md#revisit-scheduling-learned-change-rates-vs-uniform-polling-7-nov-2026).
 The planner is not yet wired into `rayap crawl`.

@@ -208,7 +208,7 @@ What this shows:
 
 - **Learning from the crawler's own visits captures most of what an oracle would.** At 70%
   static, the adaptive policy closes 64% of the freshness gap between uniform and oracle
-  (0.913 → 0.947 of 0.966) and cuts mean staleness from 75 h to 29 h (oracle 16 h). The
+  (0.913 → 0.947 of 0.966) and cuts mean staleness from 75 h to 28.5 h (oracle 15.6 h). The
   more static the workload, the closer it gets.
 - **Changes caught per fetch improves 1.2x to 1.85x, not 10x.** Before this was measured,
   the planning memo for rayap assumed "0.5% → 50%" and ">50% yield". Those numbers were
