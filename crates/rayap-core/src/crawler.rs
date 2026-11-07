@@ -655,6 +655,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 hash,
                 links,
                 next,
+                activity,
                 records,
                 etag,
                 last_modified,
@@ -669,10 +670,12 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                     bytes: Some(bytes as i64),
                     detail: None,
                     records,
+                    activity,
                 };
                 let discovered = self.links_to_follow(&page, links);
                 // Continuation pages are part of this page, not links: same depth, no depth
-                // limit, and fetched only when this page is new or changed.
+                // limit, and fetched only when this page is new or changed, or its activity
+                // fingerprint moved.
                 let continuation = next
                     .into_iter()
                     .map(|u| NewPage {

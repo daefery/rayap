@@ -999,8 +999,45 @@ async fn planned_runs_skip_pages_not_due_and_refetch_comments_only_on_change() {
         EventKind::Unchanged | EventKind::Gone
     ));
 
-    // Edit the post, then give the budget to both pages: the post is changed, and only then
-    // is its comment page refetched.
+    // A new comment arrives: the post text is unchanged, but its comment count moved, and
+    // that alone refetches the comment page.
+    site.set(
+        "/@tiktok/video/7106594312292453675",
+        Reply::Html(post.replace("\"commentCount\": 1274", "\"commentCount\": 1275")),
+    );
+    let before = site.requests().len();
+    let (_, events) = run(
+        &cfg,
+        &mut store,
+        Options {
+            plan: Some(Plan {
+                budget: 2,
+                ..plan.clone()
+            }),
+            ..Options::default()
+        },
+    )
+    .await;
+    let post_event = events
+        .iter()
+        .find(|e| e.url.contains("/video/7106"))
+        .unwrap();
+    assert_eq!(
+        post_event.kind,
+        EventKind::Unchanged,
+        "{:?}",
+        kinds(&events)
+    );
+    assert!(
+        site.requests()[before..]
+            .iter()
+            .any(|p| p.contains("/api/comment/list/")),
+        "comments refetched on activity: {:?}",
+        &site.requests()[before..]
+    );
+
+    // Edit the post, then give the budget to both pages: the post is changed, and its
+    // comment page is refetched for that reason too.
     site.set(
         "/@tiktok/video/7106594312292453675",
         Reply::Html(post.replace("how many frogs", "how many toads")),
@@ -1036,7 +1073,7 @@ async fn planned_runs_skip_pages_not_due_and_refetch_comments_only_on_change() {
         "replaced, not duplicated"
     );
 
-    // The planner has seen two revisits of the post (one unchanged, one changed) and reports a rate.
+    // The planner has seen three revisits of the post (two unchanged, one changed) and reports a rate.
     let rates = store.rates("frogs", plan.prior).unwrap();
     assert_eq!(
         rates.len(),

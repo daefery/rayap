@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS pages (
     title         TEXT,
     fetched_at    INTEGER,
     content_at    INTEGER,
-    continuation  INTEGER NOT NULL DEFAULT 0
+    continuation  INTEGER NOT NULL DEFAULT 0,
+    activity_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS pages_pending ON pages (queued_run, done_run);
 CREATE TABLE IF NOT EXISTS revisits (
@@ -238,6 +239,9 @@ pub struct Outcome {
     pub detail: Option<String>,
     /// Committed with the event; empty for sources that only fingerprint pages.
     pub records: Vec<NewRecord>,
+    /// Fingerprint of what makes the page's continuation pages worth refetching, when the
+    /// source separates that from the content fingerprint.
+    pub activity: Option<String>,
 }
 
 pub struct Store {
@@ -383,7 +387,8 @@ impl Store {
     /// Returns the event and the discovered pages that are new to this run (to be put in the
     /// frontier). For content outcomes (`hash` is set) the kind is decided here from the
     /// stored hash: `New`, `Changed` or `Unchanged`. Other kinds are taken as given.
-    /// `continuation` pages are queued only when the outcome is `New` or `Changed`.
+    /// `continuation` pages are queued only when the outcome is `New` or `Changed`, or when
+    /// the outcome's `activity` differs from the stored one.
     pub fn complete(
         &mut self,
         run: i64,
@@ -394,9 +399,9 @@ impl Store {
         continuation: Vec<NewPage>,
     ) -> Result<(Event, Vec<NewPage>)> {
         let tx = self.conn.transaction()?;
-        let event = complete_in(&tx, run, url, kind, outcome)?;
+        let (event, activity_changed) = complete_in(&tx, run, url, kind, outcome)?;
         let mut added = Vec::new();
-        let follow = matches!(event.kind, EventKind::New | EventKind::Changed);
+        let follow = matches!(event.kind, EventKind::New | EventKind::Changed) || activity_changed;
         let continuation = if follow { continuation } else { Vec::new() };
         for page in discovered.into_iter().chain(continuation) {
             if enqueue_in(&tx, run, &page)? {
@@ -670,6 +675,7 @@ fn migrate(tx: &Transaction) -> Result<()> {
         for (column, definition) in [
             ("content_at", "INTEGER"),
             ("continuation", "INTEGER NOT NULL DEFAULT 0"),
+            ("activity_hash", "TEXT"),
         ] {
             let present: bool = tx.query_row(
                 "SELECT count(*) > 0 FROM pragma_table_info('pages') WHERE name = ?1",
@@ -721,10 +727,22 @@ fn complete_in(
     url: &str,
     kind: Option<EventKind>,
     o: Outcome,
-) -> Result<Event> {
-    let (source, prev_hash, content_at): (String, Option<String>, Option<i64>) = tx
-        .prepare_cached("SELECT source, content_hash, content_at FROM pages WHERE url = ?1")?
-        .query_row([url], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+) -> Result<(Event, bool)> {
+    let (source, prev_hash, content_at, prev_activity): (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ) = tx
+        .prepare_cached(
+            "SELECT source, content_hash, content_at, activity_hash FROM pages WHERE url = ?1",
+        )?
+        .query_row([url], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    // Only a comparison counts: a first activity reading is covered by the page being New.
+    let activity_changed = match (&o.activity, &prev_activity) {
+        (Some(now), Some(prev)) => now != prev,
+        _ => false,
+    };
     let kind = match (&o.hash, kind) {
         (Some(hash), _) => match &prev_hash {
             None => EventKind::New,
@@ -738,9 +756,19 @@ fn complete_in(
     if o.hash.is_some() {
         tx.prepare_cached(
             "UPDATE pages SET done_run = ?1, status = ?2, etag = ?3, last_modified = ?4, content_hash = ?5,
-                 title = ?6, fetched_at = ?7, content_at = ?7 WHERE url = ?8",
+                 title = ?6, fetched_at = ?7, content_at = ?7, activity_hash = ?9 WHERE url = ?8",
         )?
-        .execute(params![run, o.status, o.etag, o.last_modified, o.hash, o.title, now, url])?;
+        .execute(params![
+            run,
+            o.status,
+            o.etag,
+            o.last_modified,
+            o.hash,
+            o.title,
+            now,
+            url,
+            o.activity
+        ])?;
         // What a revisit showed, for the change-rate estimate: only comparisons count, so
         // a first fetch records nothing.
         if let (Some(previous), Some(_)) = (content_at, &prev_hash) {
@@ -777,21 +805,24 @@ fn complete_in(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?
     .execute(params![run, now, source, url, kind.as_str(), o.status, o.title, o.hash, prev_hash, o.bytes, o.detail, records])?;
-    Ok(Event {
-        id: tx.last_insert_rowid(),
-        run,
-        at: now,
-        source,
-        url: url.to_string(),
-        kind,
-        status: o.status,
-        title: o.title,
-        hash: o.hash,
-        prev_hash,
-        bytes: o.bytes,
-        detail: o.detail,
-        records,
-    })
+    Ok((
+        Event {
+            id: tx.last_insert_rowid(),
+            run,
+            at: now,
+            source,
+            url: url.to_string(),
+            kind,
+            status: o.status,
+            title: o.title,
+            hash: o.hash,
+            prev_hash,
+            bytes: o.bytes,
+            detail: o.detail,
+            records,
+        },
+        activity_changed,
+    ))
 }
 
 #[cfg(test)]
@@ -1017,7 +1048,11 @@ mod tests {
                 vec![next.clone()],
             )
             .unwrap();
-        assert_eq!(added, [next.clone()].as_slice(), "new: the continuation is queued");
+        assert_eq!(
+            added,
+            [next.clone()].as_slice(),
+            "new: the continuation is queued"
+        );
         done(&mut s, r1, "https://a.org/?cursor=20", content("c1"));
         s.finish_run(r1).unwrap();
 
@@ -1064,6 +1099,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(added, [next], "changed: the continuation is fetched again");
+    }
+
+    #[test]
+    fn activity_change_alone_refetches_the_continuation() {
+        let mut s = Store::open_in_memory().unwrap();
+        let next = NewPage {
+            continuation: true,
+            ..page("https://a.org/?cursor=20")
+        };
+        let with_activity = |a: &str| Outcome {
+            activity: Some(a.into()),
+            ..content("same")
+        };
+        let (r1, _) = begin(&mut s);
+        s.enqueue(r1, &page("https://a.org/")).unwrap();
+        s.complete(
+            r1,
+            "https://a.org/",
+            None,
+            with_activity("c=10"),
+            Vec::new(),
+            vec![next.clone()],
+        )
+        .unwrap();
+        done(&mut s, r1, "https://a.org/?cursor=20", content("c1"));
+        s.finish_run(r1).unwrap();
+
+        // Planned runs do not queue continuation pages on their own, so what gets added
+        // here is decided by the activity comparison alone.
+        age(&s, "https://a.org/", 40.0);
+        let r2 = s.begin_run(&["src"], Some(&plan(10))).unwrap().run;
+        let (e, added) = s
+            .complete(
+                r2,
+                "https://a.org/",
+                None,
+                with_activity("c=10"),
+                Vec::new(),
+                vec![next.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            (e.kind, added.len()),
+            (EventKind::Unchanged, 0),
+            "same content, same activity"
+        );
+        s.finish_run(r2).unwrap();
+
+        age(&s, "https://a.org/", 40.0);
+        let r3 = s.begin_run(&["src"], Some(&plan(10))).unwrap().run;
+        let (e, added) = s
+            .complete(
+                r3,
+                "https://a.org/",
+                None,
+                with_activity("c=11"),
+                Vec::new(),
+                vec![next.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            e.kind,
+            EventKind::Unchanged,
+            "the page itself did not change"
+        );
+        assert_eq!(
+            added,
+            [next],
+            "but its activity did, so the continuation is fetched"
+        );
     }
 
     #[test]

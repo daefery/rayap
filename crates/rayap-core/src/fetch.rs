@@ -70,8 +70,12 @@ pub enum PageResult {
         hash: String,
         /// Links found on the page; followed on the source's host while depth allows.
         links: Vec<Url>,
-        /// Pages that complete this one (the next comment page); always followed.
+        /// Pages that complete this one (the next comment page), fetched when this page is
+        /// new or changed, or when `activity` changed.
         next: Vec<Url>,
+        /// Fingerprint of what makes `next` worth refetching (a post's comment count), when
+        /// the source separates that from content.
+        activity: Option<String>,
         records: Vec<NewRecord>,
         etag: Option<String>,
         last_modified: Option<String>,
@@ -131,6 +135,7 @@ pub async fn fetch_page(
                             hash,
                             links,
                             next: Vec::new(),
+                            activity: None,
                             records: Vec::new(),
                             etag,
                             last_modified,
@@ -145,6 +150,9 @@ pub async fn fetch_page(
                                 hash: blake3::hash(&out.fingerprint).to_hex().to_string(),
                                 links: Vec::new(),
                                 next: out.next,
+                                activity: out
+                                    .activity
+                                    .map(|a| blake3::hash(&a).to_hex().to_string()),
                                 records: out.records,
                                 etag,
                                 last_modified,
