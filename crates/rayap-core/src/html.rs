@@ -8,6 +8,11 @@ use url::Url;
 
 use crate::urlnorm;
 
+/// Version of the page fingerprint (`fingerprint_source`). History:
+/// 1 title + visible text, named entities decoded;
+/// 2 numeric character references decoded too (7 Nov 2026).
+pub const FINGERPRINT_VERSION: u32 = 2;
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Extract {
     pub title: Option<String>,

@@ -3,7 +3,7 @@
 A polite, restartable web crawl engine in Rust.
 
 rayap crawls a list of sources and writes one JSON event per page: `new`, `changed`,
-`unchanged`, `redirect`, `gone`, `blocked` or `error`. Its state lives in SQLite, so an
+`unchanged`, `rebaseline`, `redirect`, `gone`, `blocked` or `error`. Its state lives in SQLite, so an
 interrupted crawl resumes where it stopped and the next run reports only what changed.
 
 > Status: early. The engine core and CLI work and are tested.
@@ -216,15 +216,13 @@ forbid automated collection, so keep volume low and use it only where you have t
 1. Measure new comments per KB: planned vs visit-everything revisits a day apart on posts
    that still receive comments (the planner and the activity-gated comment pages are in;
    the windows tried so far had no new comments in either arm).
-2. A `rebaseline` event when an extractor's fingerprint changes, so a code change never
-   reports `changed`.
-3. Batched commits and several coordinators sharded by host, to scale past one
+2. Batched commits and several coordinators sharded by host, to scale past one
    coordinator (see "What breaks first" in the benchmark).
-4. Conditional requests (`If-None-Match`, `If-Modified-Since`). Deferred: of the 7 real
+3. Conditional requests (`If-None-Match`, `If-Modified-Since`). Deferred: of the 7 real
    sources in `examples/` and `bench/tiktok`, checked 7 Nov 2026, only one
    (andpurpose.world) sends a validator and answers 304; the rest send neither `ETag` nor
    `Last-Modified`, so conditional requests would save nothing there.
-5. Signed requests (RFC 9421 HTTP Message Signatures, Web Bot Auth), so sites can verify rayap.
+4. Signed requests (RFC 9421 HTTP Message Signatures, Web Bot Auth), so sites can verify rayap.
 
 ## License
 

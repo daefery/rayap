@@ -96,6 +96,9 @@ pub enum EventKind {
     Changed,
     /// Content is the same as the previous successful fetch.
     Unchanged,
+    /// The fingerprint method changed (a rayap upgrade), so this fetch cannot be compared with
+    /// the previous one. The new fingerprint is stored; the next fetch compares normally.
+    Rebaseline,
     /// The server redirected; `detail` holds the target, which is crawled as its own page.
     Redirect,
     /// 404 or 410.
@@ -112,6 +115,7 @@ impl EventKind {
             EventKind::New => "new",
             EventKind::Changed => "changed",
             EventKind::Unchanged => "unchanged",
+            EventKind::Rebaseline => "rebaseline",
             EventKind::Redirect => "redirect",
             EventKind::Gone => "gone",
             EventKind::Blocked => "blocked",
@@ -124,6 +128,7 @@ impl EventKind {
             "new" => EventKind::New,
             "changed" => EventKind::Changed,
             "unchanged" => EventKind::Unchanged,
+            "rebaseline" => EventKind::Rebaseline,
             "redirect" => EventKind::Redirect,
             "gone" => EventKind::Gone,
             "blocked" => EventKind::Blocked,
@@ -648,6 +653,15 @@ impl Store {
     }
 }
 
+/// The method prefix of a stored fingerprint: `v2:abc...` -> `v2`. Fingerprints written
+/// before versions were introduced have no prefix and count as version 1.
+fn fingerprint_version(hash: &str) -> &str {
+    match hash.split_once(':') {
+        Some((v, _)) if v.starts_with('v') && v.len() <= 8 => v,
+        _ => "v1",
+    }
+}
+
 struct Chosen {
     urls: Vec<String>,
     deferred: u64,
@@ -865,6 +879,11 @@ fn complete_in(
         (Some(hash), _) => match &prev_hash {
             None => EventKind::New,
             Some(prev) if prev == hash => EventKind::Unchanged,
+            // A fingerprint carries its method as a prefix (`v2:...`); two methods are not
+            // comparable, so the page is re-based rather than reported as changed.
+            Some(prev) if fingerprint_version(prev) != fingerprint_version(hash) => {
+                EventKind::Rebaseline
+            }
             Some(_) => EventKind::Changed,
         },
         (None, Some(kind)) => kind,
@@ -888,8 +907,10 @@ fn complete_in(
             o.activity
         ])?;
         // What a revisit showed, for the change-rate estimate: only comparisons count, so
-        // a first fetch records nothing.
-        if let (Some(previous), Some(_)) = (content_at, &prev_hash) {
+        // a first fetch or a rebaseline records nothing.
+        if let (Some(previous), Some(_), false) =
+            (content_at, &prev_hash, kind == EventKind::Rebaseline)
+        {
             let interval_days = (now - previous).max(0) as f64 / SECONDS_PER_DAY;
             tx.prepare_cached(
                 "INSERT INTO revisits (url, at, interval_days, changed) VALUES (?1, ?2, ?3, ?4)",
@@ -941,6 +962,24 @@ fn complete_in(
         },
         activity_changed,
     ))
+}
+
+/// Helpers for integration tests that need to shape a database by hand.
+#[doc(hidden)]
+pub mod test_support {
+    use super::Store;
+
+    /// Rewrites every stored fingerprint to its bare hash, as rayap wrote them before
+    /// fingerprints carried a method version.
+    pub fn strip_fingerprint_versions(store: &mut Store) {
+        store
+            .conn
+            .execute_batch(
+                "UPDATE pages SET content_hash = substr(content_hash, instr(content_hash, ':') + 1)
+                 WHERE content_hash LIKE 'v%:%'",
+            )
+            .expect("strip versions");
+    }
 }
 
 #[cfg(test)]
@@ -1382,6 +1421,44 @@ mod tests {
             (e.kind, e.prev_hash.as_deref()),
             (EventKind::Changed, Some("h1"))
         );
+    }
+
+    #[test]
+    fn a_new_fingerprint_method_rebases_instead_of_reporting_a_change() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (r1, _) = begin(&mut s);
+        s.enqueue(r1, &page("https://a.org/")).unwrap();
+        // Written by a rayap before fingerprints carried a version: bare hash = v1.
+        done(&mut s, r1, "https://a.org/", content("abc"));
+        s.finish_run(r1).unwrap();
+        age(&s, "https://a.org/", 1.0);
+
+        let (r2, _) = begin(&mut s);
+        let e = done(&mut s, r2, "https://a.org/", content("v2:def"));
+        assert_eq!(e.kind, EventKind::Rebaseline);
+        assert_eq!(e.prev_hash.as_deref(), Some("abc"));
+        let revisits: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM revisits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(revisits, 0, "a rebaseline teaches the planner nothing");
+        s.finish_run(r2).unwrap();
+
+        let (r3, _) = begin(&mut s);
+        assert_eq!(
+            done(&mut s, r3, "https://a.org/", content("v2:def")).kind,
+            EventKind::Unchanged
+        );
+        s.finish_run(r3).unwrap();
+        let (r4, _) = begin(&mut s);
+        assert_eq!(
+            done(&mut s, r4, "https://a.org/", content("v2:xyz")).kind,
+            EventKind::Changed,
+            "same method, different content"
+        );
+        assert_eq!(fingerprint_version("v12:x"), "v12");
+        assert_eq!(fingerprint_version("deadbeef"), "v1");
+        assert_eq!(fingerprint_version("not:a:version"), "v1");
     }
 
     #[test]

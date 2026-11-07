@@ -18,6 +18,10 @@ use url::Url;
 
 use crate::store::NewRecord;
 
+/// Version of the TikTok fingerprints. History:
+/// 1 post: id, handle, text; comments: ids and text in page order;
+/// 2 comments as a sorted set, so a reorder is not a change (7 Nov 2026).
+pub const FINGERPRINT_VERSION: u32 = 2;
 /// Comments per API page; the endpoint returns at most this many.
 pub const COMMENTS_PER_PAGE: u32 = 20;
 const COMMENT_LIST_PATH: &str = "/api/comment/list/";

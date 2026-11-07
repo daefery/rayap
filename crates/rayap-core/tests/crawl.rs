@@ -1158,3 +1158,31 @@ async fn challenge_page_holds_the_host_and_retries_without_storing() {
     // The other post was handled normally before the hold.
     assert_eq!(store.records_after(0, Some("post"), 10).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_database_from_before_fingerprint_versions_rebases_once() {
+    let site = Site::default();
+    site.set(
+        "/",
+        Reply::Html("<title>Calls</title><p>Deadline 3 Jan</p>".into()),
+    );
+    let addr = start(site.clone()).await;
+    let cfg = config(addr, 10, 0);
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(events[0].kind, EventKind::New);
+    assert!(
+        events[0].hash.as_deref().unwrap().starts_with("v2:"),
+        "{:?}",
+        events[0].hash
+    );
+
+    // Pretend the first fetch was made by a rayap that stored bare hashes (version 1).
+    rayap_core::store::test_support::strip_fingerprint_versions(&mut store);
+
+    let (stats, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(events[0].kind, EventKind::Rebaseline, "{:?}", events);
+    assert_eq!(stats.changed, 0, "a rebaseline is not a change");
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(events[0].kind, EventKind::Unchanged);
+}

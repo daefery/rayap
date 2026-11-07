@@ -147,7 +147,7 @@ pub async fn fetch_page(
                                 status,
                                 bytes: body.len(),
                                 title: None,
-                                hash: blake3::hash(&out.fingerprint).to_hex().to_string(),
+                                hash: fingerprint(tiktok::FINGERPRINT_VERSION, &out.fingerprint),
                                 links: Vec::new(),
                                 next: out.next,
                                 activity: out
@@ -223,6 +223,13 @@ pub async fn fetch_robots(clients: &Clients, url: &str) -> RobotsResult {
     }
 }
 
+/// A stored fingerprint: the method's version, then the hash. Two fingerprints are only
+/// compared when their versions agree; otherwise the page is re-based (see the store).
+/// Bump a method's version whenever its bytes can change for the same page.
+fn fingerprint(version: u32, bytes: &[u8]) -> String {
+    format!("v{version}:{}", blake3::hash(bytes).to_hex())
+}
+
 struct Digested {
     title: Option<String>,
     hash: String,
@@ -240,16 +247,14 @@ fn digest(body: &[u8], is_html: bool, url: &Url, product_token: &str) -> Digeste
     if !is_html {
         return Digested {
             title: None,
-            hash: blake3::hash(body).to_hex().to_string(),
+            hash: fingerprint(1, body),
             links: Vec::new(),
             record: None,
         };
     }
     let text = String::from_utf8_lossy(body);
     let extract = html::extract(&text, url, product_token);
-    let hash = blake3::hash(&extract.fingerprint_source())
-        .to_hex()
-        .to_string();
+    let hash = fingerprint(html::FINGERPRINT_VERSION, &extract.fingerprint_source());
     let mut visible = extract.text;
     let truncated = visible.len() > MAX_PAGE_TEXT;
     if truncated {
