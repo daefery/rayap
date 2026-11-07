@@ -1,0 +1,103 @@
+# Public pages of funders that give grants to AI and open-source projects (7 Nov 2026).
+# Funders' own pages, not aggregators: these are where a deadline or a new call appears first.
+# Public pages only; rayap never logs in. LinkedIn is not here: its robots.txt disallows
+# everything for every crawler but LinkedInBot and the search engines it whitelists.
+
+[crawler]
+contact = "https://github.com/daefery/rayap"
+per_host_delay_ms = 5000
+
+# Open source infrastructure and maintainers
+[[source]]
+name = "sovereign-tech-programs"
+url = "https://www.sovereign.tech/programs"
+
+[[source]]
+name = "nlnet-open-calls"
+url = "https://nlnet.nl/propose/"
+
+[[source]]
+name = "prototype-fund"
+url = "https://prototypefund.de/en/apply/"   # 403 to every non-browser client (also curl with a browser UA): a WAF rule; rayap reports it as error
+
+[[source]]
+name = "open-technology-fund"
+url = "https://www.opentech.fund/funds/"
+
+[[source]]
+name = "github-secure-oss-fund"
+url = "https://resources.github.com/github-secure-open-source-fund/"
+
+[[source]]
+name = "opensats-apply"
+url = "https://opensats.org/apply"
+
+[[source]]
+name = "futo-grants"
+url = "https://futo.org/grants/"
+
+[[source]]
+name = "alpha-omega"
+url = "https://alpha-omega.dev/grants/"
+
+[[source]]
+name = "floss-fund"
+url = "https://floss.fund/"
+
+[[source]]
+name = "nsf-safe-ose"
+url = "https://www.nsf.gov/funding/opportunities/safe-ose-safety-security-privacy-open-source-ecosystems"
+
+# AI
+[[source]]
+name = "mozilla-human-scale-ai"
+url = "https://www.mozillafoundation.org/en/what-we-do/grantmaking/incubator/human-scale-ai/"   # www.mozillafoundation.org hangs from this network (TCP connects, no reply, 7 Nov 2026); robots.txt unreachable => rayap blocks it
+
+[[source]]
+name = "mozilla-builders"
+url = "https://builders.mozilla.org/"
+
+[[source]]
+name = "humanity-ai-open-call"
+url = "https://humanityai.ai/press-release-open-call-for-grants/"
+
+[[source]]
+name = "cooperative-ai-fund"
+url = "https://www.cooperativeai.com/post/10m-funding-call-launched-with-schmidt-sciences-google-deepmind-and-aria"
+
+[[source]]
+name = "foresight-ai-nodes"
+url = "https://foresight.org/grants/ai-science-safety-nodes-rfp/"
+
+[[source]]
+name = "openmined-research-grants"
+url = "https://openmined.org/research/grants/"
+
+[[source]]
+name = "openai-codex-oss-fund"
+url = "https://openai.com/form/codex-open-source-fund/"
+
+[[source]]
+name = "simons-math-ai"
+url = "https://www.simonsfoundation.org/funding/targeted-grants-to-mathai-institutes-2027/"
+
+[[source]]
+name = "wasp-hs-open-calls"
+url = "https://wasp-hs.org/calls/"
+
+[[source]]
+name = "lacuna-fund"
+url = "https://lacunafund.org/apply/"
+
+# Aggregators (change often; useful as a discovery signal, lower trust)
+[[source]]
+name = "devgrantsdaily-opensource"
+url = "https://devgrantsdaily.com/grants/opensource/"
+
+[[source]]
+name = "grant-desk-ai"
+url = "https://www.artificialnouveau.com/smalltools/grants/ai-worldwide/"
+
+[[source]]
+name = "awesome-maintainer-funding"
+url = "https://github.com/mechko/awesome-maintainer-funding"

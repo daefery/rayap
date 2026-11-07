@@ -109,6 +109,29 @@ An event:
 
 `id` only increases, so a consumer can store the last id it processed and read on from there.
 
+### Watching grant pages
+
+`examples/ai-oss-grants.toml` lists 23 public pages of funders that give grants to AI and
+open-source projects (Sovereign Tech, NLnet, OTF, GitHub Secure Open Source Fund, Mozilla,
+Humanity AI, Cooperative AI, NSF Safe-OSE, and others), 5 s between requests. Two crawls
+on 7 Nov 2026, about 3 MB and 3 minutes each:
+
+| | Run 1 | Run 2, `--changes-only` |
+|---|---|---|
+| Pages with content | 20 `new` | 20 `unchanged`, 1 `new` (a corrected URL) |
+| Redirects followed | 6 (moved URLs at FUTO, GitHub, NSF, WASP-HS) | 7 |
+| Not available | prototypefund.de `error` HTTP 403 (a WAF rule: curl with a browser UA gets 403 too); mozillafoundation.org `blocked` (its robots.txt never answers from this network, so rayap does not fetch the page); one 404 from a wrong URL guess | same |
+
+The second run printed one line. From here on, `--changes-only` shows only pages whose
+visible text changed: a new call, a moved deadline, a closed programme.
+
+**LinkedIn is not a source.** Its robots.txt is `User-agent: * Disallow: /` with a notice
+that automated access needs written permission (`whitelist-crawl@linkedin.com`); search and
+feed URLs redirect to login, company post pages return 403. rayap's robots.txt gate blocks
+every LinkedIn URL before any page request, which is the correct behaviour. The routes that
+exist are their crawl whitelist, the official APIs for a page you own, or a page you control
+where people post the links.
+
 ### Structured sources: TikTok posts
 
 A source with `kind = "tiktok"` reads a public post and its comments into records instead
