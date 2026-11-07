@@ -169,6 +169,63 @@ million per second, in 61 MiB (`scheduler-100k.json`). Earlier runs today, not a
 measured as low as 0.7 million per second while the machine was busier. This measures the cost of choosing
 what to fetch next. It is not a crawl rate.
 
+### Revisit scheduling: learned change rates vs uniform polling (7 Nov 2026)
+
+A different question from throughput: given a fixed number of revisits per day, which pages
+should get them? `rayap-core/src/revisit.rs` estimates each page's change rate from what a
+crawler actually sees ("changed since last visit?", not how many times) and splits the
+budget to maximise expected freshness (Cho & Garcia-Molina, ACM TODS 2003), with a floor so
+no page is abandoned. The benchmark (`rayap-bench freshness`) gives 20,000 pages hidden
+Poisson change rates, generates every change time once, and runs three policies on the same
+changes with the same budget: **uniform** round robin, **adaptive** (rayap's planner, learning
+from its own visits, re-planned daily), and **oracle** (the same planner given the true rates,
+the ceiling for any rate-based plan). Freshness and staleness are exact because the
+simulator knows when every change happened. Files in
+[`results/2026-11-07/`](results/2026-11-07/), commands in
+[`RUN.md`](results/2026-11-07/RUN.md).
+
+Budget 0.2 revisits per page per day (each page once per 5 days on average), 60 days,
+measured from day 20. Changing pages change between once per 100 days and once per day.
+Means of 3 seeds; the adaptive gain is the range over seeds.
+
+| Static pages | Changes caught per 1,000 fetches: uniform | adaptive | oracle | Freshness: uniform | adaptive | oracle | p90 staleness (h): uniform | adaptive | oracle |
+|---|---|---|---|---|---|---|---|---|---|
+| 30% | 323 | 432 (1.33–1.34x) | 465 | 0.794 | 0.830 | 0.848 | 114 | 75 | 64 |
+| 70% | 137 | 219 (1.59–1.61x) | 255 | 0.913 | 0.947 | 0.966 | 114 | 50 | 29 |
+| 90% | 46 | 81 (1.75–1.79x) | 99 | 0.971 | 0.986 | 0.996 | 114 | 38 | 10 |
+| 97% | 14 | 25 (1.79–1.85x) | 32 | 0.991 | 0.996 | 1.000 | 114 | 34 | 3 |
+
+Same workload at 70% static, varying the budget (seed 1):
+
+| Revisits per page per day | Caught per 1,000: uniform | adaptive | oracle | Freshness: uniform | adaptive | oracle | p90 staleness (h): uniform | adaptive | oracle |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.05 | 214 | 274 (1.28x) | 324 | 0.841 | 0.851 | 0.878 | 469 | 329 | 212 |
+| 0.2 | 137 | 219 (1.61x) | 255 | 0.913 | 0.947 | 0.966 | 114 | 50 | 29 |
+| 0.5 | 82 | 109 (1.33x) | 116 | 0.953 | 0.978 | 0.987 | 45 | 18 | 10 |
+| 1.0 | 50 | 59 (1.18x) | 61 | 0.973 | 0.989 | 0.993 | 22 | 9 | 5 |
+
+What this shows:
+
+- **Learning from the crawler's own visits captures most of what an oracle would.** At 70%
+  static, the adaptive policy closes 64% of the freshness gap between uniform and oracle
+  (0.913 → 0.947 of 0.966) and cuts mean staleness from 75 h to 29 h (oracle 16 h). The
+  more static the workload, the closer it gets.
+- **Changes caught per fetch improves 1.2x to 1.85x, not 10x.** Before this was measured,
+  the planning memo for rayap assumed "0.5% → 50%" and ">50% yield". Those numbers were
+  labelled assumed and are wrong for this model: with a floor that keeps every page visited
+  at least monthly and a budget of one visit per 5 days, the arithmetic caps the gain. The
+  gain is largest at a moderate budget (0.2/day) and shrinks when the budget is either
+  starved (0.05: too few observations to learn from) or generous (1.0: uniform is already
+  fresh).
+- **Catching more changes per fetch than the oracle is not a win.** At a wider rate range
+  (log10 rate up to +1, not archived) the adaptive policy caught 629 per 1,000 against the
+  oracle's 528, by chasing pages that change several times a day, and lost freshness on
+  everything else. Freshness and staleness are the metrics; caught-per-fetch is reported
+  because it is easy to game.
+- **Not measured here:** real pages. Real change processes are bursty, not Poisson;
+  fingerprints can flap on noisy pages, which would inflate estimated rates. The planner is
+  not wired into the crawl loop yet (`rayap crawl` still visits every source each run).
+
 ## What breaks first
 
 1. **The single coordinator.** One task schedules every request and commits every
@@ -208,6 +265,8 @@ cargo build --release
 ./target/release/rayap-bench e2e --hosts 10000 --delay-ms 2000 --concurrency 8192
 # scheduling core only
 ./target/release/rayap-bench scheduler --hosts 100000 --pages-per-host 50
+# revisit policies against hidden change rates (about 8 s, no network)
+./target/release/rayap-bench freshness --pages 20000 --days 60 --static-share 0.7 --log10-rate-max 0
 # negative control: crawler deliberately 10 ms too fast for the referee
 ./target/release/rayap-bench e2e --hosts 10000 --delay-ms 2000 --crawler-delay-ms 1990
 # with a CPU flamegraph

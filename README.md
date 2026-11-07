@@ -33,6 +33,20 @@ internet. [bench/README.md](bench/README.md) has:
 - a scaling table showing where one coordinator stops scaling (about 20,000 hosts);
 - the limits.
 
+**Revisit scheduling.** Given a fixed budget of revisits, rayap's planner
+(`revisit.rs`) learns each page's change rate from its own visits and spends the budget
+where changes happen. On 20,000 simulated pages with hidden change rates, one revisit per
+page per 5 days, 70% of pages static: changes caught per 1,000 fetches 137 → 219
+(**1.6x**; an oracle that knows the true rates gets 255), freshness 0.913 → 0.947 (oracle
+0.966), mean staleness 75 h → 29 h. The gain is 1.2x to 1.85x across the workloads tried,
+never an order of magnitude; the table and the reasons are in
+[bench/README.md](bench/README.md#revisit-scheduling-learned-change-rates-vs-uniform-polling-7-nov-2026).
+The planner is not yet wired into `rayap crawl`.
+
+**Structured sources.** 118 public TikTok posts → 115 `post` and 4,072 `comment` records,
+three deleted or under-review posts reported as `gone` rather than stored as content, 0
+challenge pages, 2 s between requests ([bench/tiktok](bench/tiktok/README.md)).
+
 ## How it behaves
 
 - **One request at a time per host**, with a configurable delay between requests
@@ -146,11 +160,17 @@ and use it only where you have the right to.
 
 ## Roadmap
 
-1. Batched commits and several coordinators sharded by host, to scale past one
+1. Wire the revisit planner into `rayap crawl`: per-page due times from learned change
+   rates, and for structured sources revisit the cheap page first (a TikTok comment page is
+   66 KiB for up to 20 records; the post page is 428 KiB for one). Measure bytes per new
+   record and new records per fetch against today's visit-everything baseline.
+2. Batched commits and several coordinators sharded by host, to scale past one
    coordinator (see "What breaks first" in the benchmark).
-2. Conditional requests (`If-None-Match`, `If-Modified-Since`) and bytes per check.
-3. Signed requests (RFC 9421 HTTP Message Signatures, Web Bot Auth), so sites can verify rayap.
-4. Adaptive revisits: learn how often each page changes and spend requests where changes happen.
+3. Conditional requests (`If-None-Match`, `If-Modified-Since`). Deferred: of the 7 real
+   sources in `examples/` and `bench/tiktok`, checked 7 Nov 2026, only one
+   (andpurpose.world) sends a validator and answers 304; the rest send neither `ETag` nor
+   `Last-Modified`, so conditional requests would save nothing there.
+4. Signed requests (RFC 9421 HTTP Message Signatures, Web Bot Auth), so sites can verify rayap.
 
 ## License
 

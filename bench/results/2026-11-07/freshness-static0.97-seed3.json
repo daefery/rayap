@@ -1,0 +1,58 @@
+{
+  "mode": "freshness",
+  "params": {
+    "budget_per_page_per_day": 0.2,
+    "days": 60.0,
+    "floor_per_day": 0.03333333333333333,
+    "log10_rate_per_day": [
+      -2.0,
+      0.0
+    ],
+    "pages": 20000,
+    "prior": {
+      "rate_per_day": 0.2,
+      "weight": 0.5
+    },
+    "replan_every_days": 1,
+    "seed": 3,
+    "static_share": 0.97,
+    "warmup_days": 20.0
+  },
+  "provenance": {
+    "rayap_revision": "43c0c16"
+  },
+  "results": [
+    {
+      "changes_caught_per_1000_fetches": 13.78125,
+      "fetches": 160000,
+      "fetches_that_found_a_change": 2205,
+      "freshness": 0.9913288706070791,
+      "mean_staleness_hours": 74.3340849422407,
+      "p90_staleness_hours": 113.86657632550498,
+      "pages_never_refreshed_after_a_change": 182,
+      "policy": "uniform"
+    },
+    {
+      "changes_caught_per_1000_fetches": 24.66875,
+      "fetches": 160000,
+      "fetches_that_found_a_change": 3947,
+      "freshness": 0.9962790735330095,
+      "mean_staleness_hours": 17.909151177216746,
+      "p90_staleness_hours": 33.012378448919065,
+      "pages_never_refreshed_after_a_change": 59,
+      "policy": "adaptive"
+    },
+    {
+      "changes_caught_per_1000_fetches": 31.03125,
+      "fetches": 160000,
+      "fetches_that_found_a_change": 4965,
+      "freshness": 0.9996088360536692,
+      "mean_staleness_hours": 1.511453818678173,
+      "p90_staleness_hours": 2.9354880937747794,
+      "pages_never_refreshed_after_a_change": 9,
+      "policy": "oracle"
+    }
+  ],
+  "true_changes_total": 7611,
+  "wall_seconds": 6.69
+}
