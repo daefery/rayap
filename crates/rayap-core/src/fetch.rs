@@ -157,11 +157,14 @@ pub async fn fetch_page(
                                 etag,
                                 last_modified,
                             },
-                            Err(reason) => PageResult::Invalid {
-                                status,
-                                bytes: body.len(),
-                                reason,
-                            },
+                            Err(reason) => {
+                                keep_invalid_body(url, &body);
+                                PageResult::Invalid {
+                                    status,
+                                    bytes: body.len(),
+                                    reason,
+                                }
+                            }
                         }
                     }
                 },
@@ -237,6 +240,30 @@ fn digest(
     } else {
         (None, blake3::hash(body).to_hex().to_string(), Vec::new())
     }
+}
+
+/// With `RAYAP_KEEP_INVALID=<dir>`, bodies the extractor refused are written there for
+/// inspection (what did the site actually send?). Off by default.
+fn keep_invalid_body(url: &Url, body: &[u8]) {
+    let Ok(dir) = std::env::var("RAYAP_KEEP_INVALID") else {
+        return;
+    };
+    let name = format!(
+        "{}-{}.body",
+        unix_now_ms(),
+        blake3::hash(url.as_str().as_bytes())
+            .to_hex()
+            .get(..12)
+            .unwrap_or("")
+    );
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(std::path::Path::new(&dir).join(name), body);
+}
+
+fn unix_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 fn header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {

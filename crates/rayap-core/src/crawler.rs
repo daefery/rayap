@@ -28,6 +28,9 @@ use crate::{Config, Error, Result, tiktok, urlnorm};
 
 /// Delay used for 429/503 without a usable Retry-After.
 const SLOW_DOWN_DEFAULT: Duration = Duration::from_secs(60);
+/// Hold on a host that answered a page with a challenge (a 200 that is really a "slow down").
+/// Longer than a 429 default: the host said nothing about when to come back.
+const CHALLENGE_HOLD: Duration = Duration::from_secs(5 * 60);
 /// RFC 9309 §2.3.1.2: follow at least five consecutive redirects for robots.txt.
 const MAX_ROBOTS_HOPS: u32 = 5;
 /// Redirects followed from one source URL before the chain is reported as an error.
@@ -692,12 +695,42 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             PageResult::Invalid {
                 status,
                 bytes,
+                reason: tiktok::Invalid::Challenge(detail),
+            } => {
+                // Treated like a 429 without Retry-After: the host is held, the page retried.
+                // Nothing is stored, so the last good content and its hash stay in place.
+                self.stats.bytes += bytes as u64;
+                let wait = CHALLENGE_HOLD.max(delay);
+                self.hold(host, now, wait)?;
+                if page.attempts + 1 >= self.config.crawler.max_attempts {
+                    let detail = format!("{detail}, gave up after {} attempts", page.attempts + 1);
+                    self.commit(
+                        &page.url,
+                        Some(EventKind::Error),
+                        Outcome {
+                            status: Some(status),
+                            bytes: Some(bytes as i64),
+                            detail: Some(detail),
+                            ..Outcome::default()
+                        },
+                        Vec::new(),
+                    )?;
+                } else {
+                    self.retry(host, &mut page, now)?;
+                }
+                Ok(wait)
+            }
+            PageResult::Invalid {
+                status,
+                bytes,
                 reason,
             } => {
                 self.stats.bytes += bytes as u64;
                 let (kind, detail) = match reason {
                     tiktok::Invalid::Gone(d) => (EventKind::Gone, d),
-                    tiktok::Invalid::Error(d) => (EventKind::Error, d),
+                    tiktok::Invalid::Error(d) | tiktok::Invalid::Challenge(d) => {
+                        (EventKind::Error, d)
+                    }
                 };
                 self.commit(
                     &page.url,

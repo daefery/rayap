@@ -1082,3 +1082,79 @@ async fn planned_runs_skip_pages_not_due_and_refetch_comments_only_on_change() {
     );
     assert!(rates[0].1 > 0.0);
 }
+
+#[tokio::test]
+async fn challenge_page_holds_the_host_and_retries_without_storing() {
+    let challenge = "<!DOCTYPE html><html lang=\"en\"><head><link rel=\"preload\" as=\"script\" \
+        href=\"https://x.test/webmssdk/1.0.0.417/webmssdk.js\"><title data-rh=\"true\"></title></head>\
+        <body><div id=\"captcha_container\"></div></body></html>";
+    let site = Site::default();
+    site.set(
+        "/@tiktok/video/7106594312292453675",
+        Reply::Html(include_str!("fixtures/tiktok/post.html").into()),
+    );
+    site.set(
+        "/api/comment/list/?aid=1988&aweme_id=7106594312292453675&count=20&cursor=0",
+        Reply::Text(include_str!("fixtures/tiktok/comments.json").into()),
+    );
+    site.set("/@x/video/1", Reply::Html(challenge.into()));
+    let addr = start(site.clone()).await;
+    // max_wait short, so the run ends instead of waiting out the 5-minute challenge hold.
+    let cfg = Config::from_toml(&format!(
+        r#"
+        [crawler]
+        contact = "mailto:test@example.org"
+        per_host_delay_ms = 100
+        request_timeout_ms = 5000
+        max_attempts = 3
+        retry_backoff_ms = 50
+        max_wait_ms = 1000
+        [[source]]
+        name = "frogs"
+        url = "http://{addr}/@tiktok/video/7106594312292453675"
+        kind = "tiktok"
+        max_comments = 20
+        [[source]]
+        name = "challenged"
+        url = "http://{addr}/@x/video/1"
+        kind = "tiktok"
+        "#
+    ))
+    .unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    let (stats, events) = run(&cfg, &mut store, Options::default()).await;
+    assert!(
+        !stats.finished,
+        "the challenged page is still pending behind the hold"
+    );
+    assert!(
+        events.iter().all(|e| !e.url.ends_with("/@x/video/1")),
+        "no event for the challenged page yet: {:?}",
+        kinds(&events)
+    );
+    let hold = store
+        .active_holds()
+        .unwrap()
+        .into_iter()
+        .find(|(h, _)| h == "127.0.0.1")
+        .map(|(_, until)| until - rayap_core::store::unix_now_ms())
+        .expect("host is held");
+    assert!(
+        hold > 4 * 60 * 1000,
+        "held for minutes, not the per-host delay: {hold} ms"
+    );
+    let pending = store.pending(stats.run).unwrap();
+    let challenged = pending
+        .iter()
+        .find(|p| p.url.ends_with("/@x/video/1"))
+        .expect("the challenged page is kept for the next run");
+    assert_eq!(challenged.attempts, 1, "one attempt recorded");
+    assert!(
+        pending
+            .iter()
+            .all(|p| p.url.ends_with("/@x/video/1") || p.url.contains("/api/comment/list/")),
+        "only the challenged page and the comment page behind the same hold wait: {pending:?}"
+    );
+    // The other post was handled normally before the hold.
+    assert_eq!(store.records_after(0, Some("post"), 10).unwrap().len(), 1);
+}

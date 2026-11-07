@@ -49,7 +49,10 @@ pub struct Extracted {
 pub enum Invalid {
     /// The post no longer exists (deleted, under review, failed audit).
     Gone(String),
-    /// Challenge page, empty shell, or a body this version cannot read.
+    /// The host answered with a challenge instead of the page: it wants the client to slow
+    /// down or prove itself. The page is unchanged as far as we know; try again later.
+    Challenge(String),
+    /// Empty shell, or a body this version cannot read.
     Error(String),
 }
 
@@ -151,7 +154,11 @@ pub fn extract(url: &Url, body: &[u8], max_comments: u32) -> Result<Extracted, I
 
 fn extract_post(url: &Url, id: u64, html: &str, max_comments: u32) -> Result<Extracted, Invalid> {
     let data = embedded_json(html).ok_or_else(|| {
-        Invalid::Error("no embedded post data (challenge page or empty shell)".into())
+        if looks_like_challenge(html) {
+            Invalid::Challenge("challenge page instead of the post".into())
+        } else {
+            Invalid::Error("no embedded post data (empty shell)".into())
+        }
     })?;
     let detail = &data["__DEFAULT_SCOPE__"]["webapp.video-detail"];
     if detail.is_null() {
@@ -315,6 +322,17 @@ fn comments_url(base: &Url, post_id: u64, cursor: u32) -> Url {
     url
 }
 
+/// TikTok's verification page: a small document with an empty title that loads the
+/// `webmssdk` bot-check script and a captcha. Seen at 44 KB after about 470 requests in two
+/// hours with a 2 s delay (7 Nov 2026); the same URL answers normally a minute later.
+fn looks_like_challenge(html: &str) -> bool {
+    let head = &html[..html.len().min(4096)];
+    let empty_title =
+        head.contains("<title data-rh=\"true\"></title>") || head.contains("<title></title>");
+    let bot_check = html.contains("webmssdk") || html.to_ascii_lowercase().contains("captcha");
+    empty_title && bot_check
+}
+
 /// The JSON inside the rehydration script, if the page has one.
 fn embedded_json(html: &str) -> Option<Value> {
     let id = html.find(DATA_SCRIPT_ID)?;
@@ -462,6 +480,11 @@ mod tests {
         assert!(
             matches!(extract(&u, shell.as_bytes(), 9), Err(Invalid::Error(m)) if m.contains("no embedded"))
         );
+        let challenge = "<!DOCTYPE html><html lang=\"en\"><head><link rel=\"preload\" as=\"script\" href=\"https://sf16-website-login.neutral.ttwstatic.com/obj/tiktok_web_login_static/webmssdk/1.0.0.417/webmssdk.js\"><title data-rh=\"true\"></title></head><body><div id=\"captcha_container\"></div></body></html>";
+        assert!(matches!(
+            extract(&u, challenge.as_bytes(), 9),
+            Err(Invalid::Challenge(_))
+        ));
         let other = url("https://www.tiktok.com/@tiktok/video/1");
         assert!(
             matches!(extract(&other, POST.as_bytes(), 9), Err(Invalid::Error(m)) if m.contains("not 1"))
