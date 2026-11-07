@@ -42,6 +42,9 @@ enum Command {
         /// With --budget: visit every page at least this often, however rarely it changes.
         #[arg(long, default_value_t = 30.0)]
         max_interval_days: f64,
+        /// Coordinators to split hosts across. Useful past a few thousand hosts; 1 otherwise.
+        #[arg(long, default_value_t = 1)]
+        shards: usize,
     },
     /// Print each known page's learned change rate (per day), as JSON lines.
     Rates {
@@ -196,6 +199,7 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
             max_fetches,
             budget,
             max_interval_days,
+            shards,
         } => {
             let config = load(&config)?;
             let mut store = Store::open(&db).map_err(|e| e.to_string())?;
@@ -212,6 +216,7 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
                 Options {
                     max_fetches,
                     plan,
+                    shards,
                     ..Options::default()
                 },
                 |event| {

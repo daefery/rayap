@@ -164,11 +164,22 @@ fn config(addr: SocketAddr, delay_ms: u64, depth: u32) -> Config {
     .unwrap()
 }
 
+/// `RAYAP_TEST_SHARDS=N` runs every test with N coordinators; the behaviour must not differ.
+fn shards() -> usize {
+    std::env::var("RAYAP_TEST_SHARDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+}
+
 async fn run(
     config: &Config,
     store: &mut Store,
-    options: Options,
+    mut options: Options,
 ) -> (rayap_core::Stats, Vec<Event>) {
+    if options.shards == 0 {
+        options.shards = shards();
+    }
     let mut events = Vec::new();
     let stats = crawl(config, store, options, |e| events.push(e.clone()))
         .await
@@ -717,9 +728,15 @@ async fn panicking_event_callback_still_leaves_the_host_delay_stored() {
         let db = db.clone();
         let crashed = tokio::spawn(async move {
             let mut store = Store::open(&db).unwrap();
-            crawl(&cfg, &mut store, Options::default(), |_| {
-                panic!("consumer crashed")
-            })
+            crawl(
+                &cfg,
+                &mut store,
+                Options {
+                    shards: shards(),
+                    ..Options::default()
+                },
+                |_| panic!("consumer crashed"),
+            )
             .await
         })
         .await;
@@ -1185,4 +1202,80 @@ async fn a_database_from_before_fingerprint_versions_rebases_once() {
     assert_eq!(stats.changed, 0, "a rebaseline is not a change");
     let (_, events) = run(&cfg, &mut store, Options::default()).await;
     assert_eq!(events[0].kind, EventKind::Unchanged);
+}
+
+#[tokio::test]
+async fn shards_hand_cross_host_pages_over_and_agree_on_the_end() {
+    // Many hosts (127.0.0.1 and localhost resolve to the same server, plus a redirect chain
+    // across them) so that with several shards pages must cross shard boundaries. Every
+    // outcome must be recorded exactly once and the run must finish.
+    let site = Site::default();
+    site.set(
+        "/",
+        Reply::Html("<a href='/a'>a</a><a href='/b'>b</a>".into()),
+    );
+    site.set("/a", Reply::Html("a".into()));
+    site.set("/b", Reply::Redirect("/c".into()));
+    site.set("/c", Reply::Html("c".into()));
+    let addr = start(site.clone()).await;
+    // Two sources on two host names for the same server: they land on different shards
+    // (or the same; either way the result must be identical).
+    let cfg = Config::from_toml(&format!(
+        r#"
+        [crawler]
+        contact = "mailto:test@example.org"
+        per_host_delay_ms = 10
+        request_timeout_ms = 5000
+        max_attempts = 3
+        retry_backoff_ms = 50
+        [[source]]
+        name = "ip"
+        url = "http://{addr}/"
+        max_depth = 1
+        [[source]]
+        name = "name"
+        url = "http://localhost:{}/"
+        max_depth = 1
+        "#,
+        addr.port()
+    ))
+    .unwrap();
+    for shards in [1, 2, 3, 8] {
+        let mut store = Store::open_in_memory().unwrap();
+        let (stats, events) = run(
+            &cfg,
+            &mut store,
+            Options {
+                shards,
+                ..Options::default()
+            },
+        )
+        .await;
+        assert!(stats.finished, "shards={shards}");
+        let mut got: Vec<(String, String)> = events
+            .iter()
+            .map(|e| (e.url.clone(), e.kind.as_str().to_string()))
+            .collect();
+        got.sort();
+        // Each host: /, /a, /b (redirect), /c  => 4 events, twice.
+        assert_eq!(got.len(), 8, "shards={shards}: {got:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::Redirect)
+                .count(),
+            2,
+            "shards={shards}"
+        );
+        assert_eq!(
+            stats.requests, 8,
+            "shards={shards}: every page fetched exactly once"
+        );
+        let urls: std::collections::HashSet<&str> = events.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(urls.len(), 8, "shards={shards}: no page recorded twice");
+        assert!(
+            store.pending(stats.run).unwrap().is_empty(),
+            "shards={shards}"
+        );
+    }
 }

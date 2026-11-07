@@ -17,6 +17,7 @@ pub mod robots;
 pub mod store;
 pub mod tiktok;
 pub mod urlnorm;
+pub mod writer;
 
 pub use config::{Config, SourceKind};
 pub use crawler::{Options, Stats, crawl};

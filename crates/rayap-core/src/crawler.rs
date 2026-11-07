@@ -1,19 +1,25 @@
 //! The crawl loop.
 //!
-//! One coordinator owns the frontier, the robots.txt cache and the store; fetches run as
-//! tasks and report back over a channel. Because only the coordinator touches state, the
-//! scheduling rules hold without locks:
+//! Hosts are split across `shards` coordinators by a hash of the host name. Each coordinator
+//! owns the frontier, robots.txt cache and in-flight count for its hosts; fetches run as
+//! tasks and report back over a channel. One writer task owns the store (`writer.rs`).
+//! Because a host belongs to exactly one coordinator and only that coordinator touches its
+//! state, the scheduling rules hold without locks:
 //!
 //! - every request, including robots.txt and each redirect hop of a robots.txt fetch, is
-//!   handed out by the frontier, so a host never has two requests in flight and always gets
-//!   its delay between requests;
+//!   handed out by the host's frontier, so a host never has two requests in flight and
+//!   always gets its delay between requests;
 //! - no page is requested before its origin's robots.txt is known;
 //! - a host told to wait (Retry-After, backoff) is held for the full time, and the hold is
 //!   stored so a restart does not contact it early.
+//!
+//! A page discovered on one shard whose host belongs to another is handed over through a
+//! channel; it is already recorded in the store by then, so a crash loses nothing.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep_until};
@@ -24,6 +30,7 @@ use crate::fetch::{self, Clients, Extractor, PageResult, RobotsResult};
 use crate::frontier::{Frontier, Next};
 use crate::robots::{self, Rules};
 use crate::store::{Event, EventKind, NewPage, Outcome, Plan, Store, unix_now_ms};
+use crate::writer::{self, Writer};
 use crate::{Config, Error, Result, tiktok, urlnorm};
 
 /// Delay used for 429/503 without a usable Retry-After.
@@ -58,6 +65,8 @@ pub struct Options {
     /// Visit only the pages most due by learned change rate (plus never-fetched ones),
     /// instead of every known page. Ignored when resuming an unfinished run.
     pub plan: Option<Plan>,
+    /// Coordinators to split hosts across. 0 or 1 means one coordinator, as before.
+    pub shards: usize,
 }
 
 impl std::fmt::Debug for Options {
@@ -67,6 +76,7 @@ impl std::fmt::Debug for Options {
             .field("resolver", &self.resolver.as_ref().map(|_| "custom"))
             .field("busy_micros", &self.busy_micros.is_some())
             .field("plan", &self.plan)
+            .field("shards", &self.shards)
             .finish()
     }
 }
@@ -83,9 +93,11 @@ pub struct Stats {
     pub finished: bool,
     /// Known pages the plan left for a later run.
     pub deferred: u64,
-    /// Time the coordinator spent working (scheduling and recording), as opposed to waiting.
-    /// Close to the run's wall time means the coordinator is the bottleneck.
+    /// Time the coordinators spent working (scheduling and recording), as opposed to waiting,
+    /// summed over shards. Close to shards x wall time means they are the bottleneck.
     pub coordinator_busy: Duration,
+    /// Pages handed from one shard to another because a link crossed hosts.
+    pub handed_over: u64,
 }
 
 /// A page waiting to be fetched.
@@ -159,9 +171,10 @@ enum Done {
     },
 }
 
-struct Crawler<'a, F: FnMut(&Event)> {
+/// One coordinator: the hosts whose hash lands on it, and nothing else.
+struct Crawler<'a> {
     config: &'a Config,
-    store: &'a mut Store,
+    writer: Writer,
     run: i64,
     frontier: Frontier<Work>,
     robots: HashMap<String, RobotsState>,
@@ -171,23 +184,55 @@ struct Crawler<'a, F: FnMut(&Event)> {
     robots_failures: HashMap<String, u32>,
     /// Crawl-delay per host, per origin; a host uses the largest among its origins.
     origin_delays: HashMap<String, HashMap<String, Duration>>,
-    seed_hosts: HashMap<String, String>,
+    seed_hosts: &'a HashMap<String, String>,
     /// How each source's pages are read, by source name.
-    extractors: HashMap<String, Extractor>,
+    extractors: &'a HashMap<String, Extractor>,
     in_flight: usize,
     stats: Stats,
-    on_event: F,
     /// Events of the batch being recorded, delivered once it is committed.
     pending_events: Vec<Event>,
+    /// Which shard owns a host, and the channel to it.
+    routing: Routing,
+    /// Pages discovered here that belong to another shard, sent after the batch commits.
+    outbound: Vec<NewPage>,
+}
+
+/// How hosts map to shards, and the shared count of idle shards used to agree on the end.
+#[derive(Clone)]
+struct Routing {
+    shards: usize,
+    me: usize,
+    handover: Vec<mpsc::UnboundedSender<NewPage>>,
+    idle_shards: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Routing {
+    fn owner(&self, host: &str) -> usize {
+        if self.shards <= 1 {
+            return 0;
+        }
+        // A stable, cheap hash: the same host always lands on the same shard within a run.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in host.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (h % self.shards as u64) as usize
+    }
+
+    fn mine(&self, host: &str) -> bool {
+        self.owner(host) == self.me
+    }
 }
 
 /// Crawls every configured source once, resuming an unfinished run if there is one.
-/// `on_event` is called after each event is durably stored.
+/// `on_event` is called after each event is durably stored, from the task that called
+/// `crawl`, in commit order within a shard.
 pub async fn crawl<F: FnMut(&Event)>(
     config: &Config,
     store: &mut Store,
     options: Options,
-    on_event: F,
+    mut on_event: F,
 ) -> Result<Stats> {
     let clients = Arc::new(Clients::new(config, options.resolver.clone())?);
     let sources: Vec<&str> = config.sources.iter().map(|s| s.name.as_str()).collect();
@@ -221,46 +266,23 @@ pub async fn crawl<F: FnMut(&Event)>(
             store.enqueue(run, &seed)?;
         }
     }
-    let mut crawler = Crawler {
-        config,
-        store,
-        run,
-        frontier: Frontier::new(config.per_host_delay()),
-        robots: HashMap::new(),
-        waiting_for_robots: HashMap::new(),
-        robots_failures: HashMap::new(),
-        origin_delays: HashMap::new(),
-        seed_hosts,
-        extractors,
-        in_flight: 0,
-        pending_events: Vec::new(),
-        stats: Stats {
-            run,
-            resumed,
-            deferred: start.deferred,
-            ..Stats::default()
-        },
-        on_event,
-    };
+    let seed_hosts = Arc::new(seed_hosts);
+    let extractors = Arc::new(extractors);
 
     // Sample both clocks together so a stored hold is not shortened by setup time.
     let (now, now_ms) = (Instant::now(), unix_now_ms());
-    for (host, until_ms) in crawler.store.active_holds()? {
-        let wait = Duration::from_millis(u64::try_from(until_ms - now_ms).unwrap_or(0));
-        crawler.frontier.hold(&host, deadline(now, wait), now);
-    }
+    let holds: Vec<(String, Duration)> = store
+        .active_holds()?
+        .into_iter()
+        .map(|(host, until_ms)| {
+            let wait = Duration::from_millis(u64::try_from(until_ms - now_ms).unwrap_or(0));
+            (host, wait)
+        })
+        .collect();
     // robots.txt failures earlier in this run keep counting towards max_attempts.
-    for (origin, failures) in crawler.store.robots_failures(run)? {
-        crawler.robots.insert(
-            origin,
-            RobotsState::Unreachable {
-                until: now,
-                reason: "unreachable earlier in this run".into(),
-                failures,
-            },
-        );
-    }
-    for p in crawler.store.pending(run)? {
+    let robots_failures = store.robots_failures(run)?;
+    let mut pending: Vec<(String, Page)> = Vec::new();
+    for p in store.pending(run)? {
         if !config.sources.iter().any(|s| s.name == p.source) {
             continue;
         }
@@ -274,26 +296,262 @@ pub async fn crawl<F: FnMut(&Event)>(
             hops: p.hops,
             attempts: p.attempts,
         };
-        crawler
-            .frontier
-            .push(&urlnorm::host(&url), Work::Page(page), now);
+        pending.push((urlnorm::host(&url), page));
+    }
+
+    // The store moves into the writer for the duration of the crawl and comes back after.
+    let owned = std::mem::replace(store, Store::open_in_memory()?);
+    let (writer, writer_task) = writer::spawn(owned);
+
+    let shards = options.shards.max(1);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
+    let mut handover_tx = Vec::with_capacity(shards);
+    let mut handover_rx = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        let (tx, rx) = mpsc::unbounded_channel::<NewPage>();
+        handover_tx.push(tx);
+        handover_rx.push(rx);
+    }
+    let mut shard_tasks = JoinSet::new();
+    let idle_shards = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let budget = Arc::new(FetchBudget::new(options.max_fetches));
+    for (me, inbox) in handover_rx.into_iter().enumerate() {
+        let routing = Routing {
+            shards,
+            me,
+            handover: handover_tx.clone(),
+            idle_shards: Arc::clone(&idle_shards),
+        };
+        let mut holds_here = Vec::new();
+        for (host, wait) in &holds {
+            if routing.mine(host) {
+                holds_here.push((host.clone(), *wait));
+            }
+        }
+        let mut pending_here = Vec::new();
+        for (host, page) in &pending {
+            if routing.mine(host) {
+                pending_here.push((host.clone(), page.clone()));
+            }
+        }
+        let shard = ShardSetup {
+            config: config.clone(),
+            writer: writer.clone(),
+            run,
+            seed_hosts: Arc::clone(&seed_hosts),
+            extractors: Arc::clone(&extractors),
+            clients: Arc::clone(&clients),
+            holds: holds_here,
+            robots_failures: robots_failures.clone(),
+            pending: pending_here,
+            routing,
+            inbox,
+            events: event_tx.clone(),
+            budget: Arc::clone(&budget),
+            busy_micros: options.busy_micros.clone(),
+            start_now: now,
+        };
+        shard_tasks.spawn(run_shard(shard));
+    }
+    // Only shards hold senders now; the writer stops when the last shard drops its handle.
+    drop(writer);
+    drop(handover_tx);
+    drop(event_tx);
+
+    // Deliver events as shards commit them; collect shard results as they finish.
+    let mut stats = Stats {
+        run,
+        resumed,
+        deferred: start.deferred,
+        ..Stats::default()
+    };
+    let mut complete = true;
+    let mut shards_left = shards;
+    loop {
+        tokio::select! {
+            Some(event) = event_rx.recv() => on_event(&event),
+            joined = shard_tasks.join_next(), if shards_left > 0 => {
+                match joined {
+                    Some(Ok(Ok(outcome))) => {
+                        stats.requests += outcome.stats.requests;
+                        stats.events += outcome.stats.events;
+                        stats.changed += outcome.stats.changed;
+                        stats.bytes += outcome.stats.bytes;
+                        stats.coordinator_busy += outcome.stats.coordinator_busy;
+                        stats.handed_over += outcome.stats.handed_over;
+                        complete &= outcome.complete;
+                        shards_left -= 1;
+                    }
+                    Some(Ok(Err(e))) => return Err(e),
+                    Some(Err(e)) => return Err(Error::Task(e.to_string())),
+                    None => { shards_left = 0; }
+                }
+            }
+            else => break,
+        }
+        if shards_left == 0 {
+            // Shards are done; drain whatever events are still queued.
+            while let Ok(event) = event_rx.try_recv() {
+                on_event(&event);
+            }
+            break;
+        }
+    }
+
+    let recovered = writer_task
+        .await
+        .map_err(|e| Error::Task(e.to_string()))??;
+    *store = recovered;
+    if complete {
+        store.finish_run(run)?;
+    }
+    stats.finished = complete;
+    Ok(stats)
+}
+
+struct ShardSetup {
+    config: Config,
+    writer: Writer,
+    run: i64,
+    seed_hosts: Arc<HashMap<String, String>>,
+    extractors: Arc<HashMap<String, Extractor>>,
+    clients: Arc<Clients>,
+    holds: Vec<(String, Duration)>,
+    robots_failures: Vec<(String, u32)>,
+    pending: Vec<(String, Page)>,
+    routing: Routing,
+    inbox: mpsc::UnboundedReceiver<NewPage>,
+    events: mpsc::UnboundedSender<Event>,
+    budget: Arc<FetchBudget>,
+    busy_micros: Option<Arc<std::sync::atomic::AtomicU64>>,
+    start_now: Instant,
+}
+
+/// `Options::max_fetches`, shared by all shards: a page request is started only if a unit
+/// of budget can be taken first, so the total across shards never exceeds the limit.
+struct FetchBudget {
+    limit: Option<u64>,
+    taken: std::sync::atomic::AtomicU64,
+}
+
+impl FetchBudget {
+    fn new(limit: Option<u64>) -> Self {
+        Self {
+            limit,
+            taken: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.limit
+            .is_some_and(|m| self.taken.load(Ordering::SeqCst) >= m)
+    }
+
+    /// Takes one unit; false if none is left.
+    fn take(&self) -> bool {
+        let Some(limit) = self.limit else {
+            return true;
+        };
+        self.taken
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < limit).then_some(n + 1)
+            })
+            .is_ok()
+    }
+}
+
+struct ShardOutcome {
+    stats: Stats,
+    complete: bool,
+}
+
+/// One coordinator's loop. Structurally the single-coordinator loop of before, plus an
+/// inbox of pages handed over by other shards.
+async fn run_shard(setup: ShardSetup) -> Result<ShardOutcome> {
+    let ShardSetup {
+        config,
+        writer,
+        run,
+        seed_hosts,
+        extractors,
+        clients,
+        holds,
+        robots_failures,
+        pending,
+        routing,
+        mut inbox,
+        events,
+        budget,
+        busy_micros,
+        start_now: now,
+    } = setup;
+    let mut crawler = Crawler {
+        config: &config,
+        writer,
+        run,
+        frontier: Frontier::new(config.per_host_delay()),
+        robots: HashMap::new(),
+        waiting_for_robots: HashMap::new(),
+        robots_failures: HashMap::new(),
+        origin_delays: HashMap::new(),
+        seed_hosts: &seed_hosts,
+        extractors: &extractors,
+        in_flight: 0,
+        stats: Stats::default(),
+        pending_events: Vec::new(),
+        routing,
+        outbound: Vec::new(),
+    };
+    for (host, wait) in holds {
+        crawler.frontier.hold(&host, deadline(now, wait), now);
+    }
+    for (origin, failures) in robots_failures {
+        crawler.robots.insert(
+            origin,
+            RobotsState::Unreachable {
+                until: now,
+                reason: "unreachable earlier in this run".into(),
+                failures,
+            },
+        );
+    }
+    for (host, page) in pending {
+        crawler.frontier.push(&host, Work::Page(page), now);
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Done>();
     let mut tasks = JoinSet::new();
-    let limit = config.crawler.max_concurrency;
+    // Each shard gets its share of the connection budget.
+    let limit = (config.crawler.max_concurrency / crawler.routing.shards.max(1)).max(1);
+    let idle_shards = Arc::clone(&crawler.routing.idle_shards);
+    let mut marked_idle = false;
 
     loop {
         // Start as much work as the concurrency limit and the schedule allow.
         let busy_from = Instant::now();
         let mut wake = None;
-        while crawler.in_flight < limit && !crawler.fetch_budget_spent(options.max_fetches) {
-            match crawler.next_step(Instant::now())? {
+        while crawler.in_flight < limit && !budget.spent() {
+            match crawler.next_step(Instant::now()).await? {
                 Step::Start { host, job } => {
-                    crawler.in_flight += 1;
                     if matches!(job, Job::Page(_)) {
+                        if !budget.take() {
+                            // Another shard spent the last unit between our check and now.
+                            // Put the page back; this shard is done starting pages.
+                            if let Job::Page(page) = job {
+                                crawler.frontier.push_front(
+                                    &host,
+                                    Work::Page(page),
+                                    Instant::now(),
+                                );
+                                crawler
+                                    .frontier
+                                    .release(&host, Instant::now(), Duration::ZERO);
+                            }
+                            break;
+                        }
                         crawler.stats.requests += 1;
                     }
+                    crawler.in_flight += 1;
                     let clients = Arc::clone(&clients);
                     let tx = tx.clone();
                     let max_body = config.crawler.max_body_bytes;
@@ -331,21 +589,39 @@ pub async fn crawl<F: FnMut(&Event)>(
                 Step::Again => {}
             }
         }
-        // Pages settled without a request (robots.txt blocks) were committed one by one.
-        crawler.deliver_events();
+        // Pages settled without a request (robots.txt blocks) are committed and delivered.
+        crawler.flush(&events).await?;
 
         let too_far = wake.is_some_and(|at| at > Instant::now() + config.max_wait());
-        if crawler.in_flight == 0
-            && (wake.is_none() || too_far || crawler.fetch_budget_spent(options.max_fetches))
-        {
-            // Nothing in flight and nothing to do soon. Held hosts keep their stored holds
-            // and their pages stay pending, so the next run picks them up.
-            break;
+        let idle = crawler.in_flight == 0 && (wake.is_none() || too_far || budget.spent());
+        if idle {
+            // Nothing in flight and nothing to do soon here. Another shard may still hand us
+            // a page, so the run ends only when every shard is idle. Marking idle first and
+            // checking the inbox after is what makes this sound: a handover sent before its
+            // sender went idle is already in our channel when we see the full count.
+            if !marked_idle {
+                idle_shards.fetch_add(1, Ordering::SeqCst);
+                marked_idle = true;
+            }
+            if idle_shards.load(Ordering::SeqCst) == crawler.routing.shards {
+                match inbox.try_recv() {
+                    Ok(page) => {
+                        idle_shards.fetch_sub(1, Ordering::SeqCst);
+                        marked_idle = false;
+                        crawler.accept(page, Instant::now());
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+        } else if marked_idle {
+            idle_shards.fetch_sub(1, Ordering::SeqCst);
+            marked_idle = false;
         }
 
         let busy = busy_from.elapsed();
         crawler.stats.coordinator_busy += busy;
-        if let Some(counter) = &options.busy_micros {
+        if let Some(counter) = &busy_micros {
             counter.fetch_add(
                 busy.as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -354,24 +630,30 @@ pub async fn crawl<F: FnMut(&Event)>(
         tokio::select! {
             Some(done) = rx.recv() => {
                 let started = Instant::now();
-                // Everything that has finished is recorded in one transaction and one
-                // scheduling pass. Events are delivered only after the commit, so a consumer
+                // Everything that has finished is recorded in one batch and one scheduling
+                // pass. Events are delivered only after the writer commits, so a consumer
                 // never sees an outcome that a crash could roll back.
-                crawler.store.begin_batch()?;
                 crawler.in_flight -= 1;
-                crawler.handle(done)?;
+                crawler.handle(done).await?;
                 let mut batched = 1;
                 while batched < MAX_BATCH && let Ok(done) = rx.try_recv() {
                     crawler.in_flight -= 1;
-                    crawler.handle(done)?;
+                    crawler.handle(done).await?;
                     batched += 1;
                 }
-                crawler.store.end_batch()?;
-                crawler.deliver_events();
+                crawler.flush(&events).await?;
                 let busy = started.elapsed();
                 crawler.stats.coordinator_busy += busy;
-                if let Some(counter) = &options.busy_micros {
+                if let Some(counter) = &busy_micros {
                     counter.fetch_add(busy.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Some(page) = inbox.recv() => {
+                // A page another shard found on one of our hosts. It is already in the store.
+                let now = Instant::now();
+                crawler.accept(page, now);
+                while let Ok(page) = inbox.try_recv() {
+                    crawler.accept(page, now);
                 }
             }
             Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
@@ -380,24 +662,21 @@ pub async fn crawl<F: FnMut(&Event)>(
                 }
             }
             _ = sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {}
+            // Idle but not everyone is: look again soon in case the others finished.
+            _ = tokio::time::sleep(Duration::from_millis(20)), if idle => {}
         }
     }
 
     let complete =
         crawler.frontier.pending() == 0 && crawler.waiting_for_robots.values().all(Vec::is_empty);
-    if complete {
-        crawler.store.finish_run(run)?;
-    }
-    crawler.stats.finished = complete;
-    Ok(crawler.stats)
+    Ok(ShardOutcome {
+        stats: crawler.stats,
+        complete,
+    })
 }
 
-impl<F: FnMut(&Event)> Crawler<'_, F> {
-    fn fetch_budget_spent(&self, max: Option<u64>) -> bool {
-        max.is_some_and(|m| self.stats.requests >= m)
-    }
-
-    fn next_step(&mut self, now: Instant) -> Result<Step> {
+impl Crawler<'_> {
+    async fn next_step(&mut self, now: Instant) -> Result<Step> {
         let (host, work) = match self.frontier.next(now) {
             Next::Ready { host, item } => (host, item),
             Next::WaitUntil(at) => return Ok(Step::Wait(Some(at))),
@@ -470,7 +749,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                         ..Outcome::default()
                     },
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 Ok(Step::Again)
             }
             Some(RobotsState::Unreachable {
@@ -486,7 +766,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                         ..Outcome::default()
                     },
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 Ok(Step::Again)
             }
             Some(RobotsState::Unreachable { .. } | RobotsState::Fetching) => {
@@ -503,7 +784,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         }
     }
 
-    fn handle(&mut self, done: Done) -> Result<()> {
+    async fn handle(&mut self, done: Done) -> Result<()> {
         let now = Instant::now();
         // Store the host's ordinary delay before recording anything, so that whatever happens
         // next (a crash, a panicking event callback) a restart still waits at least this long.
@@ -520,7 +801,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 result,
             } => self.handle_robots(&host, origin, hops, result, now),
             Done::Page { host, page, result } => {
-                let wait = self.handle_page(&host, page, result, now)?;
+                let wait = self.handle_page(&host, page, result, now).await?;
                 self.release(&host, now, wait)
             }
         }
@@ -570,7 +851,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
             .unwrap_or_else(|_| host.to_string());
         match fetched {
             robots::Fetched::Rules(rules) => {
-                self.store.clear_robots_failures(self.run, &origin)?;
+                self.writer.clear_robots_failures(self.run, &origin)?;
                 let crawl_delay = rules.crawl_delay(self.config.max_crawl_delay());
                 let per_host = self.origin_delays.entry(origin_host.clone()).or_default();
                 match crawl_delay {
@@ -595,7 +876,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                 // Hold first, as for page retries: a crash between the two writes must not
                 // leave a recorded failure without its backoff.
                 self.hold(&origin_host, now, wait)?;
-                self.store
+                self.writer
                     .record_robots_failure(self.run, &origin, failures)?;
                 self.robots.insert(
                     origin.clone(),
@@ -644,7 +925,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
     fn hold(&mut self, host: &str, now: Instant, wait: Duration) -> Result<()> {
         self.frontier.hold(host, deadline(now, wait), now);
         let ms = i64::try_from(wait.as_millis()).unwrap_or(i64::MAX);
-        self.store.hold_host(host, unix_now_ms().saturating_add(ms))
+        self.writer
+            .hold_host(host, unix_now_ms().saturating_add(ms))
     }
 
     /// Ends a request to `host`: the host may be contacted again after `wait` (or later if
@@ -656,7 +938,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
     }
 
     /// Records the page outcome and returns how long the host must rest before its next request.
-    fn handle_page(
+    async fn handle_page(
         &mut self,
         host: &str,
         mut page: Page,
@@ -703,7 +985,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                         continuation: true,
                     })
                     .collect();
-                self.commit_with(&page.url, None, outcome, discovered, continuation)?;
+                self.commit_with(&page.url, None, outcome, discovered, continuation)
+                    .await?;
                 Ok(delay)
             }
             PageResult::Invalid {
@@ -728,7 +1011,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                             ..Outcome::default()
                         },
                         Vec::new(),
-                    )?;
+                    )
+                    .await?;
                 } else {
                     self.retry(host, &mut page, now)?;
                 }
@@ -756,7 +1040,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                         ..Outcome::default()
                     },
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 Ok(delay)
             }
             PageResult::Redirect { status, location } => {
@@ -788,7 +1073,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                     detail: Some(detail),
                     ..Outcome::default()
                 };
-                self.commit(&page.url, Some(kind), outcome, discovered)?;
+                self.commit(&page.url, Some(kind), outcome, discovered)
+                    .await?;
                 Ok(delay)
             }
             PageResult::SlowDown {
@@ -812,7 +1098,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                             ..Outcome::default()
                         },
                         Vec::new(),
-                    )?;
+                    )
+                    .await?;
                 } else {
                     self.retry(host, &mut page, now)?;
                 }
@@ -827,11 +1114,13 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                         ..Outcome::default()
                     },
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 Ok(delay)
             }
             PageResult::Status(status) if status >= 500 => {
                 self.retry_or_fail(host, page, Some(status), format!("HTTP {status}"), now)
+                    .await
             }
             PageResult::Status(status) => {
                 self.commit(
@@ -843,7 +1132,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                         ..Outcome::default()
                     },
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 Ok(delay)
             }
             PageResult::TooLarge { status, limit } => {
@@ -857,14 +1147,15 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                         ..Outcome::default()
                     },
                     Vec::new(),
-                )?;
+                )
+                .await?;
                 Ok(delay)
             }
-            PageResult::Network(reason) => self.retry_or_fail(host, page, None, reason, now),
+            PageResult::Network(reason) => self.retry_or_fail(host, page, None, reason, now).await,
         }
     }
 
-    fn retry_or_fail(
+    async fn retry_or_fail(
         &mut self,
         host: &str,
         mut page: Page,
@@ -884,7 +1175,8 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
                     ..Outcome::default()
                 },
                 Vec::new(),
-            )?;
+            )
+            .await?;
             return Ok(delay);
         }
         let wait = delay.max(self.config.retry_backoff() * (page.attempts + 1));
@@ -896,7 +1188,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
 
     fn retry(&mut self, host: &str, page: &mut Page, now: Instant) -> Result<()> {
         page.attempts += 1;
-        self.store.record_attempt(&page.url, page.attempts)?;
+        self.writer.record_attempt(&page.url, page.attempts)?;
         self.frontier
             .push_front(host, Work::Page(page.clone()), now);
         Ok(())
@@ -926,7 +1218,7 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
 
     /// Commits the outcome, its event and the pages it led to atomically, then queues the
     /// pages that are new to this run and reports the event.
-    fn commit(
+    async fn commit(
         &mut self,
         url: &str,
         kind: Option<EventKind>,
@@ -934,9 +1226,10 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         discovered: Vec<NewPage>,
     ) -> Result<()> {
         self.commit_with(url, kind, outcome, discovered, Vec::new())
+            .await
     }
 
-    fn commit_with(
+    async fn commit_with(
         &mut self,
         url: &str,
         kind: Option<EventKind>,
@@ -944,23 +1237,23 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         discovered: Vec<NewPage>,
         continuation: Vec<NewPage>,
     ) -> Result<()> {
-        let (event, added) =
-            self.store
-                .complete(self.run, url, kind, outcome, discovered, continuation)?;
+        let (event, added) = self
+            .writer
+            .complete(self.run, url, kind, outcome, discovered, continuation)
+            .await?;
         let now = Instant::now();
         for p in added {
             let Ok(parsed) = Url::parse(&p.url) else {
                 continue;
             };
-            let page = Page {
-                url: p.url,
-                source: p.source,
-                depth: p.depth,
-                hops: p.hops,
-                attempts: 0,
-            };
-            self.frontier
-                .push(&urlnorm::host(&parsed), Work::Page(page), now);
+            let host = urlnorm::host(&parsed);
+            if self.routing.mine(&host) {
+                self.frontier.push(&host, Work::Page(to_page(p)), now);
+            } else {
+                // Another shard's host: sent after this batch is committed, so the receiving
+                // shard never sees a page the store does not know yet.
+                self.outbound.push(p);
+            }
         }
         self.stats.events += 1;
         if matches!(event.kind, EventKind::Changed) {
@@ -970,10 +1263,45 @@ impl<F: FnMut(&Event)> Crawler<'_, F> {
         Ok(())
     }
 
-    /// Hands the committed batch's events to the consumer, in commit order.
-    fn deliver_events(&mut self) {
-        for event in self.pending_events.drain(..) {
-            (self.on_event)(&event);
+    /// Waits for the writer to commit everything this shard sent, then delivers the batch's
+    /// events and hands cross-shard pages to their owners.
+    async fn flush(&mut self, events: &mpsc::UnboundedSender<Event>) -> Result<()> {
+        if self.pending_events.is_empty() && self.outbound.is_empty() {
+            return Ok(());
         }
+        self.writer.flush().await?;
+        for event in self.pending_events.drain(..) {
+            let _ = events.send(event);
+        }
+        for p in self.outbound.drain(..) {
+            let Ok(parsed) = Url::parse(&p.url) else {
+                continue;
+            };
+            let owner = self.routing.owner(&urlnorm::host(&parsed));
+            self.stats.handed_over += 1;
+            // A closed inbox means that shard has finished; its hosts' pages stay pending in
+            // the store and the next run picks them up.
+            let _ = self.routing.handover[owner].send(p);
+        }
+        Ok(())
+    }
+
+    /// Queues a page another shard handed over.
+    fn accept(&mut self, p: NewPage, now: Instant) {
+        let Ok(parsed) = Url::parse(&p.url) else {
+            return;
+        };
+        self.frontier
+            .push(&urlnorm::host(&parsed), Work::Page(to_page(p)), now);
+    }
+}
+
+fn to_page(p: NewPage) -> Page {
+    Page {
+        url: p.url,
+        source: p.source,
+        depth: p.depth,
+        hops: p.hops,
+        attempts: 0,
     }
 }

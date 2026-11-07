@@ -41,6 +41,9 @@ enum Mode {
         delay_ms: u64,
         #[arg(long, default_value_t = 4_096)]
         concurrency: usize,
+        /// Coordinators to split hosts across (1 = the single coordinator).
+        #[arg(long, default_value_t = 1)]
+        shards: usize,
         /// Stop after this long even if pages remain (the report counts what finished).
         #[arg(long, default_value_t = 300)]
         max_seconds: u64,
@@ -249,12 +252,14 @@ async fn main() {
             flamegraph,
             sim_bin,
             crawler_delay_ms,
+            shards,
         } => {
             e2e(
                 sim_args,
                 hosts,
                 delay_ms,
                 concurrency,
+                shards,
                 max_seconds,
                 db,
                 flamegraph,
@@ -355,6 +360,7 @@ async fn e2e(
     hosts: u32,
     delay_ms: u64,
     concurrency: usize,
+    shards: usize,
     max_seconds: u64,
     db: PathBuf,
     flamegraph: Option<PathBuf>,
@@ -471,6 +477,7 @@ async fn e2e(
     let options = Options {
         resolver: Some(Arc::new(SimResolver { port })),
         busy_micros: Some(Arc::clone(&busy)),
+        shards,
         ..Options::default()
     };
     let crawl_fut = crawl(&config, &mut store, options, |e| {
@@ -561,7 +568,7 @@ async fn e2e(
             "pages": s1.1 - s0.1,
             "pages_per_second": round((s1.1 - s0.1) as f64 / secs),
             "crawler_cpu_cores": round((s1.2 - s0.2) / secs),
-            "coordinator_busy_fraction_estimate": round((s1.3 - s0.3) as f64 / 1e6 / secs),
+            "coordinator_busy_fraction_estimate": round((s1.3 - s0.3) as f64 / 1e6 / secs / shards as f64),
         })
     };
     let steady_window = if len > 0 {
@@ -583,7 +590,7 @@ async fn e2e(
     let report = json!({
         "mode": "e2e",
         "machine": machine(),
-        "params": { "hosts": hosts, "delay_ms": delay_ms, "concurrency": concurrency, "sim_args": sim_args, "max_depth": 2, "max_seconds": max_seconds },
+        "params": { "hosts": hosts, "delay_ms": delay_ms, "concurrency": concurrency, "shards": shards, "sim_args": sim_args, "max_depth": 2, "max_seconds": max_seconds },
         "provenance": {
             "rayap_revision": option_env!("RAYAP_REVISION").unwrap_or("unknown"),
             "simulator_command": format!("{} {}", sim_bin.display(), sim_resolved.join(" ")),
@@ -611,7 +618,8 @@ async fn e2e(
         "crawler_peak_rss_mib": round(rss),
         "simulator_cpu_seconds": sim_cpu.map(round),
         "simulator_cpu_cores_avg": sim_cpu.map(|c| round(c / elapsed)),
-        "coordinator_busy_fraction_whole_run": stats.as_ref().map(|s| round(s.coordinator_busy.as_secs_f64() / elapsed)),
+        "coordinator_busy_fraction_whole_run": stats.as_ref().map(|s| round(s.coordinator_busy.as_secs_f64() / elapsed / shards as f64)),
+        "handed_over_between_shards": stats.as_ref().map(|s| s.handed_over),
         "referee": referee,
         "stats": stats.map(|s| json!({ "requests": s.requests, "events": s.events, "bytes": s.bytes })),
     });
