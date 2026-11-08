@@ -977,8 +977,15 @@ fn complete_in(
         .execute(params![run, o.status, now, url])?;
     }
     let prev_hash = if o.hash.is_some() { prev_hash } else { None };
+    // An unchanged page's records are, by the fingerprint's definition, the same as what is
+    // stored, so they are not rewritten. This is most of the write volume on a revisit (the
+    // page text record alone is up to 200 KB). Records keyed by something other than the
+    // page (TikTok comments) are still replaced only when their page changed, which is
+    // exactly when their fingerprint says their set of ids and text moved.
     let records = if o.records.is_empty() {
         None
+    } else if kind == EventKind::Unchanged {
+        Some(0)
     } else {
         let mut insert = tx.prepare_cached(
             "INSERT INTO records (run, at, source, url, kind, key, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1044,6 +1051,55 @@ mod tests {
             key: key.into(),
             data: serde_json::json!({ "text": text }),
         }
+    }
+
+    #[test]
+    fn an_unchanged_page_does_not_rewrite_its_records() {
+        let mut s = Store::open_in_memory().unwrap();
+        let (r1, _) = begin(&mut s);
+        s.enqueue(r1, &page("https://a.org/")).unwrap();
+        let outcome = Outcome {
+            records: vec![record("page", "https://a.org/", "the text")],
+            ..content("v2:h1")
+        };
+        let e = done(&mut s, r1, "https://a.org/", outcome);
+        assert_eq!((e.kind, e.records), (EventKind::New, Some(1)));
+        let first_at: i64 = s
+            .conn
+            .query_row("SELECT at FROM records", [], |r| r.get(0))
+            .unwrap();
+        s.finish_run(r1).unwrap();
+
+        let (r2, _) = begin(&mut s);
+        // Same fingerprint: whatever the extractor produced this time is not written.
+        let outcome = Outcome {
+            records: vec![record("page", "https://a.org/", "would be the same")],
+            ..content("v2:h1")
+        };
+        let e = done(&mut s, r2, "https://a.org/", outcome);
+        assert_eq!((e.kind, e.records), (EventKind::Unchanged, Some(0)));
+        let (at, run, text): (i64, i64, String) = s
+            .conn
+            .query_row("SELECT at, run, data FROM records", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((at, run), (first_at, r1), "record untouched");
+        assert!(text.contains("the text"));
+        s.finish_run(r2).unwrap();
+
+        let (r3, _) = begin(&mut s);
+        let outcome = Outcome {
+            records: vec![record("page", "https://a.org/", "new text")],
+            ..content("v2:h2")
+        };
+        let e = done(&mut s, r3, "https://a.org/", outcome);
+        assert_eq!((e.kind, e.records), (EventKind::Changed, Some(1)));
+        let text: String = s
+            .conn
+            .query_row("SELECT data FROM records", [], |r| r.get(0))
+            .unwrap();
+        assert!(text.contains("new text"));
     }
 
     #[test]

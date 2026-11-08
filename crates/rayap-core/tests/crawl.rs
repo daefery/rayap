@@ -898,18 +898,26 @@ async fn tiktok_post_and_comments_become_records() {
     }
     assert!(site.user_agents().iter().all(|ua| ua.contains("rayap/")));
 
-    // Second run: nothing changed, records are not duplicated.
+    // Second run: nothing changed, so no record is written at all, let alone duplicated.
     let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    let unchanged: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Unchanged)
+        .collect();
+    assert_eq!(unchanged.len(), 3, "{:?}", kinds(&events));
     assert!(
-        events
-            .iter()
-            .filter(|e| e.kind == EventKind::Unchanged)
-            .count()
-            == 3,
-        "{:?}",
-        kinds(&events)
+        unchanged.iter().all(|e| e.records == Some(0)),
+        "{unchanged:?}"
     );
     assert_eq!(store.records_after(0, None, 100).unwrap().len(), 5);
+    assert!(
+        store
+            .records_after(0, None, 100)
+            .unwrap()
+            .iter()
+            .all(|r| r.run == 1),
+        "records still carry the run that produced them"
+    );
 }
 
 #[tokio::test]
@@ -1188,8 +1196,9 @@ async fn a_database_from_before_fingerprint_versions_rebases_once() {
     let mut store = Store::open_in_memory().unwrap();
     let (_, events) = run(&cfg, &mut store, Options::default()).await;
     assert_eq!(events[0].kind, EventKind::New);
+    let expected = format!("v{}:", rayap_core::html::FINGERPRINT_VERSION);
     assert!(
-        events[0].hash.as_deref().unwrap().starts_with("v2:"),
+        events[0].hash.as_deref().unwrap().starts_with(&expected),
         "{:?}",
         events[0].hash
     );
@@ -1278,4 +1287,54 @@ async fn shards_hand_cross_host_pages_over_and_agree_on_the_end() {
             "shards={shards}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_javascript_shell_is_an_error_not_content() {
+    let site = Site::default();
+    site.set(
+        "/",
+        Reply::Html(
+            "<!doctype html><html><head><title>Opportunities</title><script src=\"/app.js\"></script></head><body><div id=\"root\"></div></body></html>".into(),
+        ),
+    );
+    site.set(
+        "/real",
+        Reply::Html("<main><h1>Call</h1><p>Deadline 1 Dec</p></main>".into()),
+    );
+    let addr = start(site.clone()).await;
+    let cfg = Config::from_toml(&format!(
+        r#"
+        [crawler]
+        contact = "mailto:test@example.org"
+        per_host_delay_ms = 10
+        request_timeout_ms = 5000
+        [[source]]
+        name = "shell"
+        url = "http://{addr}/"
+        [[source]]
+        name = "real"
+        url = "http://{addr}/real"
+        "#
+    ))
+    .unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    let shell = events.iter().find(|e| e.source == "shell").unwrap();
+    assert_eq!(shell.kind, EventKind::Error, "{shell:?}");
+    assert!(
+        shell
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("application shell")
+    );
+    assert!(shell.hash.is_none(), "a shell is never fingerprinted");
+    let real = events.iter().find(|e| e.source == "real").unwrap();
+    assert_eq!(real.kind, EventKind::New);
+    assert_eq!(
+        store.records_after(0, Some("page"), 10).unwrap().len(),
+        1,
+        "only the real page has a record"
+    );
 }

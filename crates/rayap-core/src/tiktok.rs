@@ -48,17 +48,7 @@ pub struct Extracted {
     pub activity: Option<Vec<u8>>,
 }
 
-/// A 2xx body that must not be recorded as content.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Invalid {
-    /// The post no longer exists (deleted, under review, failed audit).
-    Gone(String),
-    /// The host answered with a challenge instead of the page: it wants the client to slow
-    /// down or prove itself. The page is unchanged as far as we know; try again later.
-    Challenge(String),
-    /// Empty shell, or a body this version cannot read.
-    Error(String),
-}
+pub use crate::fetch::Invalid;
 
 #[derive(Serialize)]
 struct Post<'a> {

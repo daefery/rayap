@@ -85,7 +85,7 @@ pub enum PageResult {
     Invalid {
         status: u16,
         bytes: usize,
-        reason: tiktok::Invalid,
+        reason: Invalid,
     },
     Redirect {
         status: u16,
@@ -128,6 +128,18 @@ pub async fn fetch_page(
                 Ok(Some(body)) => match extractor {
                     Extractor::Page { product_token } => {
                         let digested = digest(&body, is_html, url, product_token);
+                        if is_html && digested.is_shell() {
+                            // HTML with no readable text at all: a JavaScript application
+                            // shell. Recording it would fingerprint an empty page as content.
+                            keep_invalid_body(url, &body);
+                            return PageResult::Invalid {
+                                status,
+                                bytes: body.len(),
+                                reason: Invalid::Error(
+                                    "no visible text (JavaScript application shell)".into(),
+                                ),
+                            };
+                        }
                         PageResult::Body {
                             status,
                             bytes: body.len(),
@@ -223,6 +235,18 @@ pub async fn fetch_robots(clients: &Clients, url: &str) -> RobotsResult {
     }
 }
 
+/// A 2xx body that must not be recorded as content.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Invalid {
+    /// The resource no longer exists (deleted, under review, failed audit).
+    Gone(String),
+    /// The host answered with a challenge instead of the page: it wants the client to slow
+    /// down or prove itself. The page is unchanged as far as we know; try again later.
+    Challenge(String),
+    /// Empty shell, or a body this version cannot read.
+    Error(String),
+}
+
 /// A stored fingerprint: the method's version, then the hash. Two fingerprints are only
 /// compared when their versions agree; otherwise the page is re-based (see the store).
 /// Bump a method's version whenever its bytes can change for the same page.
@@ -236,6 +260,16 @@ struct Digested {
     links: Vec<Url>,
     /// The page's visible text as a `page` record, so what changed can be read later.
     record: Option<NewRecord>,
+    /// Characters of main-content text found.
+    chars: usize,
+}
+
+impl Digested {
+    /// An HTML document with no content text at all. A title alone does not count: a shell
+    /// usually has one ("TikTok - Make Your Day", "Loading...").
+    fn is_shell(&self) -> bool {
+        self.chars == 0
+    }
 }
 
 /// Visible text kept per page record. Enough for a grant call or a news page; a longer
@@ -250,6 +284,7 @@ fn digest(body: &[u8], is_html: bool, url: &Url, product_token: &str) -> Digeste
             hash: fingerprint(1, body),
             links: Vec::new(),
             record: None,
+            chars: body.len(),
         };
     }
     let text = String::from_utf8_lossy(body);
@@ -264,6 +299,7 @@ fn digest(body: &[u8], is_html: bool, url: &Url, product_token: &str) -> Digeste
         }
         visible.truncate(cut);
     }
+    let chars = visible.chars().count();
     let record = NewRecord {
         kind: "page".into(),
         key: url.to_string(),
@@ -271,8 +307,10 @@ fn digest(body: &[u8], is_html: bool, url: &Url, product_token: &str) -> Digeste
             "url": url.as_str(),
             "title": extract.title,
             "text": visible,
-            "chars": visible.chars().count(),
+            "chars": chars,
             "truncated": truncated,
+            // Whether `text` is the page's marked main region or everything outside chrome.
+            "main_region": extract.has_main,
         }),
     };
     Digested {
@@ -280,6 +318,7 @@ fn digest(body: &[u8], is_html: bool, url: &Url, product_token: &str) -> Digeste
         hash,
         links: extract.links,
         record: Some(record),
+        chars,
     }
 }
 

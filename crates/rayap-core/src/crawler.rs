@@ -31,7 +31,7 @@ use crate::frontier::{Frontier, Next};
 use crate::robots::{self, Rules};
 use crate::store::{Event, EventKind, NewPage, Outcome, Plan, Store, unix_now_ms};
 use crate::writer::{self, Writer};
-use crate::{Config, Error, Result, tiktok, urlnorm};
+use crate::{Config, Error, Result, urlnorm};
 
 /// Delay used for 429/503 without a usable Retry-After.
 const SLOW_DOWN_DEFAULT: Duration = Duration::from_secs(60);
@@ -1014,7 +1014,7 @@ impl Crawler<'_> {
             PageResult::Invalid {
                 status,
                 bytes,
-                reason: tiktok::Invalid::Challenge(detail),
+                reason: fetch::Invalid::Challenge(detail),
             } => {
                 // Treated like a 429 without Retry-After: the host is held, the page retried.
                 // Nothing is stored, so the last good content and its hash stay in place.
@@ -1047,8 +1047,8 @@ impl Crawler<'_> {
             } => {
                 self.stats.bytes += bytes as u64;
                 let (kind, detail) = match reason {
-                    tiktok::Invalid::Gone(d) => (EventKind::Gone, d),
-                    tiktok::Invalid::Error(d) | tiktok::Invalid::Challenge(d) => {
+                    fetch::Invalid::Gone(d) => (EventKind::Gone, d),
+                    fetch::Invalid::Error(d) | fetch::Invalid::Challenge(d) => {
                         (EventKind::Error, d)
                     }
                 };

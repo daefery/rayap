@@ -1,45 +1,109 @@
-//! Streaming HTML extraction: title, visible text fingerprint, and followable links.
+//! Streaming HTML extraction: title, main-content text, and followable links.
+//!
+//! Text inside site chrome (`nav`, `header`, `footer`, `aside`, the ARIA roles that mean
+//! the same, inline `svg`, and the usual screen-reader-only classes) is left out, and when a page marks its main region (`main`, `article`,
+//! `role="main"`) only that region's text counts. A page with no such marks keeps all its
+//! text. This makes the fingerprint about the content, not the menu, and keeps the stored
+//! page record readable.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use lol_html::html_content::TextType;
-use lol_html::{HtmlRewriter, Settings, doc_text, element, text};
+use lol_html::{EndTagHandler, HtmlRewriter, Settings, doc_text, element, text};
 use url::Url;
 
 use crate::urlnorm;
 
 /// Version of the page fingerprint (`fingerprint_source`). History:
 /// 1 title + visible text, named entities decoded;
-/// 2 numeric character references decoded too (7 Nov 2026).
-pub const FINGERPRINT_VERSION: u32 = 2;
+/// 2 numeric character references decoded too (7 Nov 2026);
+/// 3 chrome (nav, header, footer, aside) excluded; main/article preferred (8 Nov 2026).
+pub const FINGERPRINT_VERSION: u32 = 3;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Extract {
     pub title: Option<String>,
-    /// Body text with whitespace collapsed. Script, style, title and other non-data text is
-    /// excluded, so changes to tracking code or inline CSS do not count as content changes.
+    /// Main-content text with whitespace collapsed. Script, style, title, site chrome and
+    /// other non-content text is excluded, so a menu item or a tracking snippet changing does
+    /// not count as a content change.
     pub text: String,
+    /// True when the page marked a main region and `text` is only that region.
+    pub has_main: bool,
     /// Absolute, normalized link targets, in document order, without duplicates.
     /// Empty when the page asks robots not to follow links.
     pub links: Vec<Url>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct State {
     title: String,
     title_done: bool,
+    /// All content text, used when the page has no main region.
     text: String,
+    /// Text inside the main region only.
+    main_text: String,
+    /// How many chrome elements enclose the current position (text there is dropped).
+    chrome_depth: u32,
+    /// How many main-region elements enclose the current position.
+    main_depth: u32,
+    saw_main: bool,
     hrefs: Vec<String>,
     base: Option<String>,
     nofollow: bool,
 }
 
+const CHROME: &str = "nav, header, footer, aside, [role=navigation], [role=banner], \
+    [role=contentinfo], [role=complementary], [role=search], [role=menu], [role=menubar], \
+    [role=dialog], [aria-hidden=true], noscript, svg, template, \
+    .screen-reader-text, .sr-only, .visually-hidden";
+const MAIN: &str = "main, article, [role=main]";
+
 /// Extracts from `html`, resolving links against `page_url` (or a `<base href>`).
 /// `product_token` lets `<meta name="rayap" content="nofollow">` apply to this crawler only.
 pub fn extract(html: &str, page_url: &Url, product_token: &str) -> Extract {
-    let state = RefCell::new(State::default());
+    let state = Rc::new(RefCell::new(State::default()));
     let result = {
         let settings = Settings::new()
+            // Element handlers fire at the start tag; the end-tag handler closes the region.
+            .append_element_content_handler(element!(CHROME, |el| {
+                state.borrow_mut().chrome_depth += 1;
+                let state_for_void = Rc::clone(&state);
+                let state = Rc::clone(&state);
+                // A void element has no end tag; `on_end_tag` errors for it and we ignore that:
+                // its depth increment is undone right away.
+                let handler: EndTagHandler<'static> = Box::new(move |_| {
+                    let mut s = state.borrow_mut();
+                    s.chrome_depth = s.chrome_depth.saturating_sub(1);
+                    Ok(())
+                });
+                let on_end = el.on_end_tag(handler);
+                if on_end.is_err() {
+                    let mut s = state_for_void.borrow_mut();
+                    s.chrome_depth = s.chrome_depth.saturating_sub(1);
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!(MAIN, |el| {
+                {
+                    let mut s = state.borrow_mut();
+                    s.main_depth += 1;
+                    s.saw_main = true;
+                }
+                let state_for_void = Rc::clone(&state);
+                let state = Rc::clone(&state);
+                let handler: EndTagHandler<'static> = Box::new(move |_| {
+                    let mut s = state.borrow_mut();
+                    s.main_depth = s.main_depth.saturating_sub(1);
+                    Ok(())
+                });
+                let on_end = el.on_end_tag(handler);
+                if on_end.is_err() {
+                    let mut s = state_for_void.borrow_mut();
+                    s.main_depth = s.main_depth.saturating_sub(1);
+                }
+                Ok(())
+            }))
             .append_element_content_handler(element!("a[href]", |el| {
                 let rel = el.get_attribute("rel").unwrap_or_default();
                 let nofollow = rel
@@ -78,7 +142,9 @@ pub fn extract(html: &str, page_url: &Url, product_token: &str) -> Extract {
             // (`head > title` would miss pages that omit the optional <head> tag.)
             .append_element_content_handler(text!("title", |chunk| {
                 let mut s = state.borrow_mut();
-                if !s.title_done {
+                // A <title> inside chrome (an inline SVG's accessible name, a dialog) is not
+                // the document title, wherever in the document it appears.
+                if !s.title_done && s.chrome_depth == 0 {
                     s.title.push_str(chunk.as_str());
                     if chunk.last_in_text_node() && !s.title.trim().is_empty() {
                         s.title_done = true;
@@ -89,8 +155,15 @@ pub fn extract(html: &str, page_url: &Url, product_token: &str) -> Extract {
             .append_document_content_handler(doc_text!(|chunk| {
                 if chunk.text_type() == TextType::Data {
                     let mut s = state.borrow_mut();
+                    if s.chrome_depth > 0 {
+                        return Ok(());
+                    }
                     s.text.push_str(chunk.as_str());
                     s.text.push(' ');
+                    if s.main_depth > 0 {
+                        s.main_text.push_str(chunk.as_str());
+                        s.main_text.push(' ');
+                    }
                 }
                 Ok(())
             }));
@@ -102,7 +175,9 @@ pub fn extract(html: &str, page_url: &Url, product_token: &str) -> Extract {
     // A malformed document still yields whatever was read before the error.
     let _ = result;
 
-    let state = state.into_inner();
+    let state = Rc::try_unwrap(state)
+        .map(RefCell::into_inner)
+        .unwrap_or_else(|rc| rc.borrow().clone());
     let base = state
         .base
         .as_deref()
@@ -119,9 +194,18 @@ pub fn extract(html: &str, page_url: &Url, product_token: &str) -> Extract {
         }
     }
     let title = collapse(&decode_basic_entities(&state.title));
+    // A marked main region wins, unless it turned out empty (a shell with an empty <main>).
+    let main_text = collapse(&decode_basic_entities(&state.main_text));
+    let has_main = state.saw_main && !main_text.is_empty();
+    let text = if has_main {
+        main_text
+    } else {
+        collapse(&decode_basic_entities(&state.text))
+    };
     Extract {
         title: (!title.is_empty()).then_some(title),
-        text: collapse(&decode_basic_entities(&state.text)),
+        text,
+        has_main,
         links,
     }
 }
@@ -239,6 +323,7 @@ mod tests {
             e.text,
             "Grants Deadline: 1 Dec 2026 Call 1 About again mail"
         );
+        assert!(!e.has_main);
         let links: Vec<&str> = e.links.iter().map(Url::as_str).collect();
         assert_eq!(
             links,
@@ -250,11 +335,64 @@ mod tests {
     }
 
     #[test]
+    fn chrome_is_excluded_and_a_main_region_wins() {
+        let html = r#"<html><body>
+            <header><a href="/">Site</a> <nav><a href="/a">A</a> <a href="/b">B</a></nav></header>
+            <div role="banner">Cookie notice</div>
+            <main><h1>Open call</h1><p>Deadline 3 Jan 2027</p></main>
+            <aside>Related: <a href="/c">C</a></aside>
+            <footer>© 2026 Example</footer></body></html>"#;
+        let e = extract(html, &page(), "rayap");
+        assert!(e.has_main);
+        assert_eq!(e.text, "Open call Deadline 3 Jan 2027");
+        // Links are still collected everywhere: the crawl frontier is a different concern.
+        assert_eq!(e.links.len(), 4);
+
+        // Chrome changes do not change the fingerprint; content changes do.
+        let menu_changed = html.replace(">B</a>", ">B2</a>");
+        assert_eq!(
+            extract(&menu_changed, &page(), "rayap").fingerprint_source(),
+            e.fingerprint_source()
+        );
+        let deadline_moved = html.replace("3 Jan", "10 Jan");
+        assert_ne!(
+            extract(&deadline_moved, &page(), "rayap").fingerprint_source(),
+            e.fingerprint_source()
+        );
+    }
+
+    #[test]
+    fn without_a_main_region_all_non_chrome_text_counts() {
+        let html = "<html><body><nav>Menu</nav><div><p>Body one</p><p>Body two</p></div><footer>f</footer></body></html>";
+        let e = extract(html, &page(), "rayap");
+        assert!(!e.has_main);
+        assert_eq!(e.text, "Body one Body two");
+        // An empty <main> (application shell) falls back to the rest, so the validator's
+        // "no visible text" signal is not hidden by an empty region.
+        let shell = "<html><body><nav>Menu</nav><main id=app></main><p>Loading</p></body></html>";
+        let e = extract(shell, &page(), "rayap");
+        assert!(!e.has_main);
+        assert_eq!(e.text, "Loading");
+        // Nested chrome inside main is still chrome; article inside main is content.
+        let nested = "<main><nav>Jump to</nav><article><h2>Call</h2><p>Text</p></article><aside>Share</aside></main>";
+        assert_eq!(extract(nested, &page(), "rayap").text, "Call Text");
+        // Inline SVG (its <style> and <title> are not page text) and screen-reader labels.
+        let svg = r#"<div><svg><style>.st0{fill:#fff}</style><title>Logo</title></svg><span class="screen-reader-text">Close Search</span><p>Real</p></div>"#;
+        assert_eq!(extract(svg, &page(), "rayap").text, "Real");
+    }
+
+    #[test]
     fn svg_titles_are_not_the_page_title() {
         let html = r#"<html><head><title>Grants</title></head><body><svg><title>Icons/Close</title></svg></body></html>"#;
         assert_eq!(
             extract(html, &page(), "rayap").title.as_deref(),
             Some("Grants")
+        );
+        // An SVG icon in the header, before the document title (seen on nationalgeographic.org).
+        let icon_first = r#"<html><body><header><svg><title>Icons/Content/map</title></svg></header><title>AI Policy</title><main>Text</main></body></html>"#;
+        assert_eq!(
+            extract(icon_first, &page(), "rayap").title.as_deref(),
+            Some("AI Policy")
         );
     }
 
