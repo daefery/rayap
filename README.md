@@ -165,6 +165,23 @@ main region is empty even in a browser (alpha-omega.dev/grants on 8 Nov 2026) is
 is for the handful of sources that need it, not for broad crawls. Without a browser
 installed, rendered sources report an error instead of silently falling back to HTTP.
 
+### Remote jobs you can apply for from Indonesia
+
+`kind = "jobs"` reads remote-job boards that publish public JSON feeds for redistribution
+(Himalayas, cursor-paged; Remote OK, one page) into `job` records: title, company, the
+board's own location text verbatim, allowed timezones, type, seniority, salary, posted
+time, an excerpt, the listing URL and the attribution each board asks for. Every job is
+marked `eligible_from` the configured country by a stated rule: the board names the
+country, says Worldwide/Anywhere/Global or the country's region, or sets no country and no
+excluding timezone window; anything else is `false`, with the reason. Remotive's feed is
+supported but its robots.txt disallows `/api/*`, so rayap blocks it.
+
+`examples/remote-jobs.toml`, 8 Nov 2026: 497 jobs in 21 requests, **69 eligible from
+Indonesia** (Himalayas 7 of 398: three name Indonesia, four allow its timezones; Remote OK
+62 of 99: 47 state no restriction, 15 say worldwide). The dashboard opens a jobs
+collection with "eligible only" ticked; `/api/jobs/records?kind=job&eligible=1&q=rust`
+answers the same question as JSON.
+
 ### Structured sources: companies
 
 `kind = "company"` reads an organisation's public website: the homepage becomes one

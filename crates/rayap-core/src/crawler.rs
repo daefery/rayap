@@ -264,6 +264,14 @@ pub async fn crawl<F: FnMut(&Event)>(
                 home: url.clone(),
                 product_token: config.crawler.product_token.clone(),
             },
+            SourceKind::Jobs => Extractor::Jobs {
+                country: Arc::new(if source.country.eq_ignore_ascii_case("indonesia") {
+                    crate::jobs::Country::indonesia()
+                } else {
+                    crate::jobs::Country::named(&source.country, Vec::new())
+                }),
+                max_jobs: source.max_jobs,
+            },
         };
         extractors.insert(source.name.clone(), (extractor, source.render));
         let seed = NewPage {

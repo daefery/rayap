@@ -1,0 +1,25 @@
+# Remote jobs from boards that publish public JSON feeds for redistribution (each asks for
+# attribution and a link back to the listing; both are in every record). Every job is marked
+# `eligible_from.eligible` for applicants living in `country`, by a stated rule: the board
+# names the country, says Worldwide/Anywhere/Global or the country's region, or sets no
+# country and no excluding timezone window. The board's own location text is kept verbatim.
+
+[crawler]
+contact = "https://github.com/daefery/rayap"
+per_host_delay_ms = 3000
+
+[[source]]
+name = "himalayas"
+url = "https://himalayas.app/jobs/api?limit=20"
+kind = "jobs"
+country = "Indonesia"
+max_jobs = 400          # 20 per page, cursor-paged; newest first
+
+# Remotive's API notice invites reuse with attribution, but its robots.txt disallows /api/*
+# for every crawler, so rayap blocks it (checked 8 Nov 2026). Not included.
+
+[[source]]
+name = "remoteok"
+url = "https://remoteok.com/api"
+kind = "jobs"
+country = "Indonesia"   # one page, ~100 newest

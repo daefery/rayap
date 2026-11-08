@@ -77,6 +77,13 @@ pub struct Source {
     /// For `kind = "tiktok"`: comments to collect per post (rounded up to whole API pages).
     #[serde(default = "default_max_comments")]
     pub max_comments: u32,
+    /// For `kind = "jobs"`: the country applicants live in; each job is marked eligible or
+    /// not for it. Default Indonesia.
+    #[serde(default = "default_country")]
+    pub country: String,
+    /// For `kind = "jobs"`: listings to collect from a paged feed.
+    #[serde(default = "default_max_jobs")]
+    pub max_jobs: u32,
     /// Fetch this source's pages with a headless browser so their JavaScript runs first.
     /// For pages that are an empty shell over plain HTTP. Needs Chromium or Chrome on PATH
     /// (or `RAYAP_BROWSER`); without one the pages are reported as errors.
@@ -95,10 +102,19 @@ pub enum SourceKind {
     /// An organisation's website: a `company` record from the homepage and a `company_page`
     /// record for each well-known page it links (about, careers, contact, blog, products).
     Company,
+    /// A remote-job board's public JSON feed (Himalayas, Remotive, Remote OK): `job` records,
+    /// each marked whether `country` may apply.
+    Jobs,
 }
 
 fn default_max_comments() -> u32 {
     60
+}
+fn default_country() -> String {
+    "Indonesia".into()
+}
+fn default_max_jobs() -> u32 {
+    400
 }
 
 fn default_product_token() -> String {
@@ -183,6 +199,12 @@ impl Config {
                     source.name, source.url
                 )));
             };
+            if source.kind == SourceKind::Jobs && crate::jobs::classify(&url).is_none() {
+                return Err(Error::Config(format!(
+                    "source '{}': a jobs source must be a known feed: https://himalayas.app/jobs/api, https://remotive.com/api/remote-jobs or https://remoteok.com/api",
+                    source.name
+                )));
+            }
             if source.kind == SourceKind::Tiktok
                 && !matches!(
                     crate::tiktok::classify(&url),

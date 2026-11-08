@@ -9,7 +9,7 @@
 //! - `GET /api/collections`                names, summaries
 //! - `GET /api/{c}/pages?q=`               known pages with their latest state
 //! - `GET /api/{c}/events?after=&limit=`   change events, oldest first
-//! - `GET /api/{c}/records?q=&kind=&limit=` extracted records, newest first
+//! - `GET /api/{c}/records?q=&kind=&limit=&eligible=1` extracted records, newest first
 //!
 //! Nothing here writes. Crawling stays in `rayap crawl`.
 
@@ -133,6 +133,8 @@ struct RecordsQuery {
     q: Option<String>,
     kind: Option<String>,
     limit: Option<usize>,
+    /// `1`: only records whose `data.eligible_from.eligible` is true (job records).
+    eligible: Option<String>,
 }
 
 async fn records(
@@ -147,8 +149,19 @@ async fn records(
     let q = query.q.as_deref().filter(|q| !q.trim().is_empty());
     let kind = query.kind.as_deref().filter(|k| !k.trim().is_empty());
     let limit = query.limit.unwrap_or(200).min(5000);
-    match store.search_records(q, kind, limit) {
-        Ok(rows) => json_response(json!(rows)),
+    let eligible_only = matches!(query.eligible.as_deref(), Some("1" | "true"));
+    match store.search_records(q, kind, if eligible_only { 5000 } else { limit }) {
+        Ok(rows) => {
+            let rows: Vec<_> = if eligible_only {
+                rows.into_iter()
+                    .filter(|r| r.data["eligible_from"]["eligible"] == json!(true))
+                    .take(limit)
+                    .collect()
+            } else {
+                rows
+            };
+            json_response(json!(rows))
+        }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

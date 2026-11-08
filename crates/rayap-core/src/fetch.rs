@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::robots::MAX_ROBOTS_BYTES;
 use crate::store::NewRecord;
-use crate::{Config, Result, company, html, render, signing, tiktok, urlnorm};
+use crate::{Config, Result, company, html, jobs, render, signing, tiktok, urlnorm};
 
 /// How a fetched body is read, decided by the source's kind.
 #[derive(Debug, Clone)]
@@ -22,6 +22,11 @@ pub enum Extractor {
     Tiktok { max_comments: u32 },
     /// A company website: homepage, then its well-known pages.
     Company { home: Url, product_token: String },
+    /// A job board feed, marking each job for `country`.
+    Jobs {
+        country: Arc<jobs::Country>,
+        max_jobs: u32,
+    },
 }
 
 pub struct Clients {
@@ -276,6 +281,30 @@ fn digest_body(
                 records: out.records,
                 etag,
                 last_modified,
+            }
+        }
+        Extractor::Jobs { country, max_jobs } => {
+            match jobs::extract(url, &body, country, *max_jobs) {
+                Ok(out) => PageResult::Body {
+                    status,
+                    bytes: body.len(),
+                    title: None,
+                    hash: fingerprint(jobs::FINGERPRINT_VERSION, &out.fingerprint),
+                    links: Vec::new(),
+                    next: out.next,
+                    activity: None,
+                    records: out.records,
+                    etag,
+                    last_modified,
+                },
+                Err(reason) => {
+                    keep_invalid_body(url, &body);
+                    PageResult::Invalid {
+                        status,
+                        bytes: body.len(),
+                        reason: Invalid::Error(reason),
+                    }
+                }
             }
         }
         Extractor::Tiktok { max_comments } => match tiktok::extract(url, &body, *max_comments) {

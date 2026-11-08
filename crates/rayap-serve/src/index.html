@@ -51,6 +51,7 @@
   <div class="tabs" id="tabs"></div>
   <input type="search" id="q" placeholder="search title, url, source, record text…" autocomplete="off">
   <select id="kind" title="record kind"><option value="">all records</option></select>
+  <label id="eligible-wrap" style="display:none; font-size:13px; color:var(--muted)"><input type="checkbox" id="eligible"> eligible only</label>
   <div class="views">
     <button data-view="pages" class="on">Pages</button>
     <button data-view="records">Records</button>
@@ -64,7 +65,7 @@
 <footer>Read-only view of the crawl databases. Run <code>rayap crawl</code> to update; reload to see it.</footer>
 <script>
 const $ = s => document.querySelector(s);
-const state = { collections: [], c: null, view: 'pages', q: '', kind: '' };
+const state = { collections: [], c: null, view: 'pages', q: '', kind: '', eligible: false };
 const fmtTime = t => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 16) + 'Z' : '';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
 const kb = b => b == null ? '' : (b / 1024).toFixed(0) + ' KB';
@@ -110,6 +111,11 @@ function fillKinds(c) {
   sel.value = [...sel.options].some(o => o.value === cur) ? cur : '';
   state.kind = sel.value;
   sel.style.display = state.view === 'records' ? '' : 'none';
+  const hasJobs = (c?.summary?.record_kinds || []).some(([k]) => k === 'job');
+  $('#eligible-wrap').style.display = state.view === 'records' && hasJobs ? '' : 'none';
+  // A jobs collection opens with eligible-only on; the box is remembered per page load after.
+  if (hasJobs && state.eligibleDefaulted !== c.name) { state.eligible = true; state.eligibleDefaulted = c.name; $('#eligible').checked = true; }
+  if (!hasJobs) state.eligible = false;
 }
 
 async function render() {
@@ -125,7 +131,7 @@ async function render() {
   try {
     const q = encodeURIComponent(state.q);
     if (state.view === 'pages') out.innerHTML = pagesTable(await api(`/api/${c.name}/pages?q=${q}`));
-    else if (state.view === 'records') out.innerHTML = recordsTable(await api(`/api/${c.name}/records?q=${q}&kind=${encodeURIComponent(state.kind)}&limit=500`));
+    else if (state.view === 'records') out.innerHTML = recordsTable(await api(`/api/${c.name}/records?q=${q}&kind=${encodeURIComponent(state.kind)}&limit=500${state.eligible ? '&eligible=1' : ''}`));
     else out.innerHTML = eventsTable(await api(`/api/${c.name}/events?limit=1000`));
   } catch (e) { out.innerHTML = `<p class="empty err">${esc(e.message)}</p>`; }
 }
@@ -157,6 +163,8 @@ function recordsTable(rows) {
 function recordBody(r) {
   const d = r.data || {};
   if (r.kind === 'page') return pageRecord(r, d);
+  if (r.kind === 'job') return jobRecord(r, d);
+  if (r.kind === 'company') return companyRecord(r, d);
   const author = d.author?.handle ? `<b>@${esc(d.author.handle)}</b> ` : '';
   const text = d.text != null ? `<div class="t">${author}${esc(d.text)}</div>` : `<pre class="t">${esc(JSON.stringify(d, null, 1))}</pre>`;
   const meta = [];
@@ -167,6 +175,34 @@ function recordBody(r) {
   const link = d.url || r.url;
   meta.push(`<a href="${esc(link)}" target="_blank" rel="noopener">${esc(r.key)}</a>`);
   return text + `<div class="meta">${meta.join(' · ')}</div>`;
+}
+
+function jobRecord(r, d) {
+  const e = d.eligible_from || {};
+  const badge = e.eligible
+    ? `<span class="k new" title="rule: ${esc(e.reason)}">eligible from ${esc(e.country)}</span>`
+    : `<span class="k unchanged" title="rule: ${esc(e.reason)}">not for ${esc(e.country)}</span>`;
+  const meta = [];
+  if (d.location) meta.push(`location: ${esc(d.location)}`);
+  else if (d.timezones?.length) meta.push(`UTC ${d.timezones.map(z => (z >= 0 ? '+' : '') + z).join(', ')}`);
+  if (d.employment_type) meta.push(esc(d.employment_type));
+  if (d.seniority) meta.push(esc(d.seniority));
+  if (d.salary) meta.push(esc(d.salary));
+  if (d.posted_at) meta.push(`posted ${fmtTime(d.posted_at)}`);
+  if (d.categories?.length) meta.push(d.categories.slice(0, 6).map(esc).join(', '));
+  return `<div><b>${esc(d.title)}</b> at ${esc(d.company)} ${badge}</div>
+    <div class="t excerpt">${esc(d.excerpt || '')}</div>
+    <div class="meta">${meta.join(' · ')}</div>
+    <div class="meta"><a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a> · via ${esc(d.board)}</div>`;
+}
+
+function companyRecord(r, d) {
+  const pages = Object.entries(d.pages || {}).map(([role, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(role)}</a>`).join(' · ');
+  const social = Object.entries(d.social || {}).map(([n, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(n)}</a>`).join(' · ');
+  return `<div><b>${esc(d.name || d.host)}</b>${d.legal_name ? ` <span class="meta">(${esc(d.legal_name)})</span>` : ''}</div>
+    <div class="t excerpt">${esc(d.description || '')}</div>
+    <div class="meta">${pages}${social ? ` · ${social}` : ''}</div>
+    <div class="meta"><a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a></div>`;
 }
 
 function pageRecord(r, d) {
@@ -198,6 +234,7 @@ function eventsTable(rows) {
 let timer;
 $('#q').addEventListener('input', e => { state.q = e.target.value; clearTimeout(timer); timer = setTimeout(render, 200); });
 $('#kind').addEventListener('change', e => { state.kind = e.target.value; render(); });
+$('#eligible').addEventListener('change', e => { state.eligible = e.target.checked; render(); });
 document.querySelectorAll('.views button').forEach(b => b.onclick = () => { state.view = b.dataset.view; render(); });
 loadCollections().then(render).catch(e => { $('#out').innerHTML = `<p class="empty err">${esc(e.message)}</p>`; });
 </script>

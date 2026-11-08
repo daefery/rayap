@@ -13,6 +13,7 @@ pub mod crawler;
 mod fetch;
 pub mod frontier;
 pub mod html;
+pub mod jobs;
 pub mod render;
 pub mod revisit;
 pub mod robots;
