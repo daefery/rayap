@@ -35,3 +35,20 @@ kind = "company"
 name = "mozilla-foundation"
 url = "https://foundation.mozilla.org/"
 kind = "company"
+
+# Employers whose remote postings appeared on the aggregator feeds. Their careers pages
+# link an ATS board; rayap follows it to the employer's own postings (the original source).
+[[source]]
+name = "wikimedia"
+url = "https://wikimediafoundation.org/"
+kind = "company"
+
+[[source]]
+name = "toptal"
+url = "https://www.toptal.com/"
+kind = "company"
+
+[[source]]
+name = "safetywing"
+url = "https://safetywing.com/"
+kind = "company"

@@ -105,6 +105,9 @@ pub enum SourceKind {
     /// A remote-job board's public JSON feed (Himalayas, Remotive, Remote OK): `job` records,
     /// each marked whether `country` may apply.
     Jobs,
+    /// An employer's own job board through its applicant-tracking system's public API
+    /// (Greenhouse, Lever, Ashby): `job` records from the original source.
+    Ats,
 }
 
 fn default_max_comments() -> u32 {
@@ -199,6 +202,12 @@ impl Config {
                     source.name, source.url
                 )));
             };
+            if source.kind == SourceKind::Ats && crate::ats::classify(&url).is_none() {
+                return Err(Error::Config(format!(
+                    "source '{}': an ats source must be a board API URL: https://boards-api.greenhouse.io/v1/boards/<slug>/jobs, https://api.lever.co/v0/postings/<slug> or https://api.ashbyhq.com/posting-api/job-board/<slug>",
+                    source.name
+                )));
+            }
             if source.kind == SourceKind::Jobs && crate::jobs::classify(&url).is_none() {
                 return Err(Error::Config(format!(
                     "source '{}': a jobs source must be a known feed: https://himalayas.app/jobs/api, https://remotive.com/api/remote-jobs or https://remoteok.com/api",

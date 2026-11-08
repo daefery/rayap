@@ -190,8 +190,10 @@ function jobRecord(r, d) {
   if (d.salary) meta.push(esc(d.salary));
   if (d.posted_at) meta.push(`posted ${fmtTime(d.posted_at)}`);
   if (d.categories?.length) meta.push(d.categories.slice(0, 6).map(esc).join(', '));
+  const why = d.hiring_sentence ? `<div class="meta">says: “${esc(d.hiring_sentence.slice(0, 300))}${d.hiring_sentence.length > 300 ? '…' : ''}”</div>` : '';
   return `<div><b>${esc(d.title)}</b> at ${esc(d.company)} ${badge}</div>
     <div class="t excerpt">${esc(d.excerpt || '')}</div>
+    ${why}
     <div class="meta">${meta.join(' · ')}</div>
     <div class="meta"><a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a> · via ${esc(d.board)}</div>`;
 }

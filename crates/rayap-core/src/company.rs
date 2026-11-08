@@ -136,6 +136,17 @@ pub fn extract(url: &Url, home: &Url, body: &[u8], product_token: &str) -> Extra
     match page {
         Page::Home => extract_home(url, &text, extract),
         Page::WellKnown(role) => {
+            // The careers page (or any page) that links an ATS board hands over to the
+            // board's API, which is where the jobs actually live.
+            // The careers page (or any page) that links an ATS board hands over to the
+            // board's API, where the jobs actually live. A page that *is* on an ATS host (a
+            // short link's redirect target) names the board in its own URL. Failing both, a
+            // Greenhouse short link is followed so its redirect reveals the board.
+            let next = crate::ats::discover(&extract.links)
+                .or_else(|| crate::ats::discover(std::slice::from_ref(url)))
+                .map(|(vendor, slug)| vec![vendor.api_url(&slug)])
+                .or_else(|| short_ats_link(&extract.links).map(|u| vec![u]))
+                .unwrap_or_default();
             let record = NewRecord {
                 kind: "company_page".into(),
                 key: url.to_string(),
@@ -156,7 +167,7 @@ pub fn extract(url: &Url, home: &Url, body: &[u8], product_token: &str) -> Extra
                 )
                 .into_bytes(),
                 records: vec![record],
-                next: Vec::new(),
+                next,
             }
         }
     }
@@ -225,7 +236,12 @@ fn extract_home(url: &Url, raw: &str, extract: html::Extract) -> Extracted {
         social,
         text: extract.text.clone(),
     };
-    let next = pages.values().filter_map(|u| Url::parse(u).ok()).collect();
+    let mut next: Vec<Url> = pages.values().filter_map(|u| Url::parse(u).ok()).collect();
+    if let Some((vendor, slug)) = crate::ats::discover(&extract.links) {
+        next.push(vendor.api_url(&slug));
+    } else if let Some(short) = short_ats_link(&extract.links) {
+        next.push(short);
+    }
     Extracted {
         fingerprint: format!(
             "company\n{}\n{}\n{}",
@@ -241,6 +257,14 @@ fn extract_home(url: &Url, raw: &str, extract: html::Extract) -> Extracted {
         }],
         next,
     }
+}
+
+/// The first Greenhouse short link (`grnh.se/<code>`) on a page; following it reveals the board.
+fn short_ats_link(links: &[Url]) -> Option<Url> {
+    links
+        .iter()
+        .find(|l| l.host_str() == Some("grnh.se") && l.path().len() > 1)
+        .cloned()
 }
 
 /// Same registrable host ignoring a `www.` prefix.

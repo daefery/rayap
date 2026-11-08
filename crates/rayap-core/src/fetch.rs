@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::robots::MAX_ROBOTS_BYTES;
 use crate::store::NewRecord;
-use crate::{Config, Result, company, html, jobs, render, signing, tiktok, urlnorm};
+use crate::{Config, Result, ats, company, html, jobs, render, signing, tiktok, urlnorm};
 
 /// How a fetched body is read, decided by the source's kind.
 #[derive(Debug, Clone)]
@@ -20,13 +20,19 @@ pub enum Extractor {
     Page { product_token: String },
     /// TikTok post and comment pages into records.
     Tiktok { max_comments: u32 },
-    /// A company website: homepage, then its well-known pages.
-    Company { home: Url, product_token: String },
+    /// A company website: homepage, then its well-known pages, then its ATS board if found.
+    Company {
+        home: Url,
+        product_token: String,
+        country: Arc<jobs::Country>,
+    },
     /// A job board feed, marking each job for `country`.
     Jobs {
         country: Arc<jobs::Country>,
         max_jobs: u32,
     },
+    /// An employer's ATS board API, marking each job for `country`.
+    Ats { country: Arc<jobs::Country> },
 }
 
 pub struct Clients {
@@ -256,7 +262,31 @@ fn digest_body(
         Extractor::Company {
             home,
             product_token,
+            country,
         } => {
+            // An employer's ATS board is the original source of its jobs; if this is the
+            // employer's own board API (reached from its careers page), read it as such.
+            if ats::classify(url).is_some() {
+                return match ats::extract(url, &body, country) {
+                    Ok(out) => PageResult::Body {
+                        status,
+                        bytes: body.len(),
+                        title: None,
+                        hash: fingerprint(ats::FINGERPRINT_VERSION, &out.fingerprint),
+                        links: Vec::new(),
+                        next: Vec::new(),
+                        activity: None,
+                        records: out.records,
+                        etag,
+                        last_modified,
+                    },
+                    Err(reason) => PageResult::Invalid {
+                        status,
+                        bytes: body.len(),
+                        reason: Invalid::Error(reason),
+                    },
+                };
+            }
             let out = company::extract(url, home, &body, product_token);
             let text_len = out
                 .records
@@ -283,6 +313,28 @@ fn digest_body(
                 last_modified,
             }
         }
+        Extractor::Ats { country } => match ats::extract(url, &body, country) {
+            Ok(out) => PageResult::Body {
+                status,
+                bytes: body.len(),
+                title: None,
+                hash: fingerprint(ats::FINGERPRINT_VERSION, &out.fingerprint),
+                links: Vec::new(),
+                next: out.next,
+                activity: None,
+                records: out.records,
+                etag,
+                last_modified,
+            },
+            Err(reason) => {
+                keep_invalid_body(url, &body);
+                PageResult::Invalid {
+                    status,
+                    bytes: body.len(),
+                    reason: Invalid::Error(reason),
+                }
+            }
+        },
         Extractor::Jobs { country, max_jobs } => {
             match jobs::extract(url, &body, country, *max_jobs) {
                 Ok(out) => PageResult::Body {

@@ -176,11 +176,22 @@ country, says Worldwide/Anywhere/Global or the country's region, or sets no coun
 excluding timezone window; anything else is `false`, with the reason. Remotive's feed is
 supported but its robots.txt disallows `/api/*`, so rayap blocks it.
 
-`examples/remote-jobs.toml`, 8 Nov 2026: 497 jobs in 21 requests, **69 eligible from
-Indonesia** (Himalayas 7 of 398: three name Indonesia, four allow its timezones; Remote OK
-62 of 99: 47 state no restriction, 15 say worldwide). The dashboard opens a jobs
-collection with "eligible only" ticked; `/api/jobs/records?kind=job&eligible=1&q=rust`
-answers the same question as JSON.
+**Aggregators are copies; the employer's own board is the original.** `kind = "ats"`
+reads an employer's board through its applicant-tracking system's public API (Greenhouse,
+Lever, Ashby), and a `company` source finds that board on its own: the careers page links
+`job-boards.greenhouse.io/<slug>`, `jobs.lever.co/<slug>`, `jobs.ashbyhq.com/<slug>` or a
+`grnh.se` short link whose redirect names it, and rayap hands over to the board's API.
+Where a posting's text lists the countries it hires in ("Countries: Brazil, Canada, …,
+Indonesia, …"), that list decides and is kept on the record as `hiring_sentence`; a vague
+location field ("Remote") does not override it in either direction.
+
+8 Nov 2026: `examples/remote-jobs.toml` (aggregators) gave 494 jobs, 68 eligible from
+Indonesia, of which 47 are only "no restriction stated". `examples/companies.toml` reached
+three employers' own boards without being told where they were (Exa and Firecrawl on
+Ashby, Wikimedia on Greenhouse via short links): 106 original postings, **16 eligible, 14
+of them because Wikimedia's postings name Indonesia in their hiring list**, 59 excluded
+because the employer marks them on-site. The dashboard shows the sentence each verdict
+came from; `/api/companies/records?kind=job&eligible=1` answers it as JSON.
 
 ### Structured sources: companies
 

@@ -171,6 +171,14 @@ enum Done {
     },
 }
 
+fn country_of(source: &crate::config::Source) -> crate::jobs::Country {
+    if source.country.eq_ignore_ascii_case("indonesia") {
+        crate::jobs::Country::indonesia()
+    } else {
+        crate::jobs::Country::named(&source.country, Vec::new())
+    }
+}
+
 /// One coordinator: the hosts whose hash lands on it, and nothing else.
 struct Crawler<'a> {
     config: &'a Config,
@@ -263,14 +271,14 @@ pub async fn crawl<F: FnMut(&Event)>(
             SourceKind::Company => Extractor::Company {
                 home: url.clone(),
                 product_token: config.crawler.product_token.clone(),
+                country: Arc::new(country_of(source)),
             },
             SourceKind::Jobs => Extractor::Jobs {
-                country: Arc::new(if source.country.eq_ignore_ascii_case("indonesia") {
-                    crate::jobs::Country::indonesia()
-                } else {
-                    crate::jobs::Country::named(&source.country, Vec::new())
-                }),
+                country: Arc::new(country_of(source)),
                 max_jobs: source.max_jobs,
+            },
+            SourceKind::Ats => Extractor::Ats {
+                country: Arc::new(country_of(source)),
             },
         };
         extractors.insert(source.name.clone(), (extractor, source.render));

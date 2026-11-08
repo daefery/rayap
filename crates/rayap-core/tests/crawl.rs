@@ -1556,3 +1556,63 @@ async fn signed_requests_carry_web_bot_auth_headers_that_verify() {
             .expect("the site can verify rayap's signature");
     }
 }
+
+#[tokio::test]
+async fn company_source_follows_the_careers_page_to_the_employers_ats_board() {
+    // The employer's site links its Greenhouse board directly on the careers page; the crawl
+    // ends at the board's API with the employer's own postings. A second employer only has
+    // short links (grnh.se style) whose redirect reveals the board.
+    let site = Site::default();
+    site.set(
+        "/",
+        Reply::Html("<main><p>Acme</p></main><nav><a href='/careers'>Careers</a></nav>".into()),
+    );
+    site.set(
+        "/careers",
+        Reply::Html("<main><p>Join us</p><a href='https://job-boards.greenhouse.io/acme/jobs/1'>Engineer</a></main>".into()),
+    );
+    let addr = start(site.clone()).await;
+    // ats::discover finds the board in the careers page's links and the company extractor
+    // queues the board's real API URL as a continuation page.
+    let cfg = Config::from_toml(&format!(
+        r#"
+        [crawler]
+        contact = "mailto:test@example.org"
+        per_host_delay_ms = 10
+        request_timeout_ms = 2000
+        max_attempts = 1
+        retry_backoff_ms = 10
+        [[source]]
+        name = "acme"
+        url = "http://{addr}/"
+        kind = "company"
+        "#
+    ))
+    .unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    let gh = events
+        .iter()
+        .find(|e| {
+            e.url
+                .starts_with("https://boards-api.greenhouse.io/v1/boards/acme/jobs")
+        })
+        .expect("the board API was queued and attempted");
+    // Offline: a network error. Online: Greenhouse answers 404 for a board that does not
+    // exist, recorded as gone. Either way the hand-off to the employer's board happened.
+    assert!(
+        matches!(
+            gh.kind,
+            EventKind::Error | EventKind::Gone | EventKind::New | EventKind::Blocked
+        ),
+        "{gh:?}"
+    );
+    assert_eq!(
+        store
+            .records_after(0, Some("company_page"), 10)
+            .unwrap()
+            .len(),
+        1,
+        "the careers page itself is still a company_page record"
+    );
+}

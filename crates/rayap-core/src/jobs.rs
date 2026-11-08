@@ -93,37 +93,52 @@ pub struct Extracted {
     pub fingerprint: Vec<u8>,
 }
 
+/// One job listing, from any board or ATS. Owned strings so `ats.rs` can build it too.
 #[derive(Serialize)]
-struct Job<'a> {
-    platform: &'static str,
-    board: &'static str,
-    job_id: String,
-    url: String,
-    title: &'a str,
-    company: &'a str,
+pub struct JobRecord {
+    pub platform: &'static str,
+    pub board: String,
+    pub job_id: String,
+    pub url: String,
+    pub title: String,
+    pub company: String,
     /// What the board says about where applicants may live, verbatim.
-    location: String,
+    pub location: String,
     /// UTC offsets the board allows, when it says.
-    timezones: Vec<f64>,
-    employment_type: Option<&'a str>,
-    seniority: Option<&'a str>,
-    categories: Vec<&'a str>,
-    salary: Option<String>,
+    pub timezones: Vec<f64>,
+    pub employment_type: Option<String>,
+    pub seniority: Option<String>,
+    pub categories: Vec<String>,
+    pub salary: Option<String>,
     /// Unix seconds.
-    posted_at: Option<i64>,
+    pub posted_at: Option<i64>,
     /// Whether the configured country is allowed, by the rule in the module doc.
-    eligible_from: Eligibility,
+    pub eligible_from: Eligibility,
     /// First ~600 chars of the description, tags stripped.
-    excerpt: String,
-    attribution: String,
+    pub excerpt: String,
+    pub attribution: String,
+    /// The posting's own sentence about where it hires, when it has one; this is what
+    /// `eligible_from` was decided on in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hiring_sentence: Option<String>,
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
-struct Eligibility {
-    country: String,
-    eligible: bool,
-    /// Which rule fired: named, region, worldwide, unrestricted, timezone, or excluded.
-    reason: &'static str,
+pub struct Eligibility {
+    pub country: String,
+    pub eligible: bool,
+    /// Which rule fired: named, region, worldwide, unrestricted, timezone, excluded, on-site.
+    pub reason: &'static str,
+}
+
+impl Eligibility {
+    pub fn excluded(country: &Country, reason: &'static str) -> Self {
+        Self {
+            country: country.name.clone(),
+            eligible: false,
+            reason,
+        }
+    }
 }
 
 /// Which board a URL belongs to, by host and path.
@@ -208,7 +223,7 @@ pub fn extract(
     })
 }
 
-fn job_from<'a>(board: Board, v: &'a Value, country: &Country) -> Option<Job<'a>> {
+fn job_from(board: Board, v: &Value, country: &Country) -> Option<JobRecord> {
     let s = |k: &str| v[k].as_str();
     let (
         id,
@@ -327,19 +342,20 @@ fn job_from<'a>(board: Board, v: &'a Value, country: &Country) -> Option<Job<'a>
             )
         }
     };
-    let eligible_from = eligibility(&location, &timezones, country);
-    Some(Job {
+    let (eligible_from, hiring_sentence) =
+        eligibility_with_body(&location, &timezones, &excerpt_full(description), country);
+    Some(JobRecord {
         platform: "web",
-        board: board.name(),
+        board: board.name().to_string(),
         job_id: id,
         url,
-        title,
-        company,
+        title: title.to_string(),
+        company: company.to_string(),
         location,
         timezones,
-        employment_type: employment,
-        seniority,
-        categories,
+        employment_type: employment.map(str::to_string),
+        seniority: seniority.map(str::to_string),
+        categories: categories.into_iter().map(str::to_string).collect(),
         salary,
         posted_at: posted,
         eligible_from,
@@ -348,7 +364,150 @@ fn job_from<'a>(board: Board, v: &'a Value, country: &Country) -> Option<Job<'a>
             "Listed on {}; link back to the listing when sharing.",
             board.name()
         ),
+        hiring_sentence,
     })
+}
+
+/// The whole description as plain text (the excerpt is the first 600 chars of this).
+fn excerpt_full(description: &str) -> String {
+    let mut text = String::with_capacity(description.len());
+    let mut in_tag = false;
+    for ch in description.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    crate::html::decode_entities(&text)
+}
+
+/// The eligibility rule, for other job sources.
+pub fn eligibility_for(location: &str, timezones: &[f64], country: &Country) -> Eligibility {
+    eligibility(location, timezones, country)
+}
+
+/// The rule applied to the location field *and* the posting body. Employers' own postings
+/// often say "Remote" in the location and list the hiring countries in the text ("Countries:
+/// Brazil, Canada, ..., Indonesia, ..."); that list decides when it exists. Returns the
+/// verdict and the sentence it came from, if any.
+pub fn eligibility_with_body(
+    location: &str,
+    timezones: &[f64],
+    body: &str,
+    country: &Country,
+) -> (Eligibility, Option<String>) {
+    if let Some(sentence) = hiring_countries_sentence(body) {
+        let lower = sentence.to_ascii_lowercase();
+        let name = country.name.to_ascii_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|w| !w.is_empty())
+            .collect();
+        let named = words.contains(&name.as_str());
+        let worldwide = ["worldwide", "anywhere", "globally", "any country"]
+            .iter()
+            .any(|k| lower.contains(k))
+            && !lower.contains("except")
+            && !lower.contains("excluding");
+        let reason = if named {
+            "named-in-text"
+        } else if worldwide {
+            "worldwide-in-text"
+        } else {
+            "excluded-in-text"
+        };
+        return (
+            Eligibility {
+                country: country.name.clone(),
+                eligible: named || worldwide,
+                reason,
+            },
+            Some(sentence),
+        );
+    }
+    (eligibility(location, timezones, country), None)
+}
+
+/// The passage of a posting that lists where it hires, if there is one. An explicit
+/// `Countries:` list wins; otherwise the first hire/eligible/reside/based cue. The passage
+/// runs from the cue to the end of the list (the first full stop followed by a space after
+/// the cue, skipping stops inside parentheses), capped at 1,200 characters.
+fn hiring_countries_sentence(body: &str) -> Option<String> {
+    let text: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = text.to_ascii_lowercase();
+    const PRIMARY: &[&str] = &[
+        "countries:",
+        "eligible countries",
+        "hiring countries",
+        "where we hire",
+    ];
+    const SECONDARY: &[&str] = &[
+        "we can hire in",
+        "able to hire in",
+        "we are able to hire",
+        "we hire in",
+        "we're hiring in",
+        "must be located in",
+        "must be based in",
+        "must reside in",
+        "candidates located in",
+        "open to candidates in",
+        "available to candidates in",
+        "applicants must be located",
+        "location requirement",
+    ];
+    let first = |cues: &[&str]| cues.iter().filter_map(|c| lower.find(c)).min();
+    let start = first(PRIMARY).or_else(|| first(SECONDARY))?;
+    let rest = &text[start..];
+    let mut depth = 0i32;
+    let mut end = rest.len().min(1200);
+    for (i, c) in rest.char_indices() {
+        if i >= end {
+            break;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '.' if depth <= 0 && rest[i + 1..].starts_with(' ') && i > 20 => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    while !rest.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(rest[..end].trim().to_string())
+}
+
+/// Description excerpt, for other job sources.
+pub fn excerpt_of(description: &str) -> String {
+    excerpt(description)
+}
+
+/// ISO-8601 with or without zone/fraction (`2026-10-07T10:35:54-04:00`), to Unix seconds.
+/// The zone offset is applied when present.
+pub fn parse_iso_lenient(s: &str) -> Option<i64> {
+    let base = parse_iso(s)?;
+    let rest = s.get(19..).unwrap_or("");
+    let rest = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = match rest.chars().next() {
+        Some('Z') | None => 0,
+        Some(sign @ ('+' | '-')) => {
+            let hh: i64 = rest.get(1..3)?.parse().ok()?;
+            let mm: i64 = rest.get(4..6).and_then(|m| m.parse().ok()).unwrap_or(0);
+            let off = hh * 3600 + mm * 60;
+            if sign == '+' { off } else { -off }
+        }
+        _ => 0,
+    };
+    Some(base - offset)
 }
 
 /// The rule from the module doc.
@@ -563,6 +722,54 @@ mod tests {
             "unrestricted"
         );
         assert_eq!(out.records[0].data["salary"], "50000–90000 USD/year");
+    }
+
+    #[test]
+    fn a_hiring_countries_sentence_in_the_body_overrides_a_vague_location() {
+        let body = "<p>We are a remote-first org.</p><p>Countries: Brazil, Canada, Colombia, Indonesia, Kenya*, Spain and the United Kingdom. Candidates must be able to work overlapping hours.</p>";
+        // Wikimedia's real shape: a US-states list first, then the Countries list, with
+        // parenthesised notes containing full stops.
+        let wm = "Please note that we are currently able to hire in the following: US States : Arizona, California (*US Territory or Federal District) Countries: Brazil, Canada, Colombia, France, Indonesia, Kenya*, Spain and the United Kingdom. Our non-US employees are hired through an EOR.";
+        let (e, s) = eligibility_with_body("Remote", &[], wm, &idn());
+        assert_eq!((e.eligible, e.reason), (true, "named-in-text"), "{s:?}");
+        assert!(s.unwrap().starts_with("Countries: Brazil"));
+        let (e, sentence) = eligibility_with_body("Remote", &[], body, &idn());
+        assert_eq!((e.eligible, e.reason), (true, "named-in-text"));
+        assert!(sentence.unwrap().starts_with("Countries: Brazil"));
+        let body2 =
+            "Remote. We can hire in the United States, Canada and Mexico. Benefits include...";
+        let (e, s) = eligibility_with_body("Remote", &[], body2, &idn());
+        assert_eq!((e.eligible, e.reason), (false, "excluded-in-text"));
+        assert_eq!(
+            s.as_deref(),
+            Some("We can hire in the United States, Canada and Mexico")
+        );
+        let body3 = "Fully remote; we hire in any country where we can legally employ you.";
+        assert_eq!(
+            eligibility_with_body("Remote", &[], body3, &idn()).0.reason,
+            "worldwide-in-text"
+        );
+        // No sentence: falls back to the location rule.
+        let (e, s) = eligibility_with_body("Remote", &[], "Great team.", &idn());
+        assert_eq!((e.reason, s), ("worldwide", None));
+    }
+
+    #[test]
+    fn lenient_iso_applies_the_zone_offset() {
+        assert_eq!(parse_iso_lenient("2026-11-06T08:51:01"), Some(1793955061));
+        assert_eq!(parse_iso_lenient("2026-11-06T08:51:01Z"), Some(1793955061));
+        assert_eq!(
+            parse_iso_lenient("2026-11-06T08:51:01.024+00:00"),
+            Some(1793955061)
+        );
+        assert_eq!(
+            parse_iso_lenient("2026-11-06T08:51:01-04:00"),
+            Some(1793955061 + 4 * 3600)
+        );
+        assert_eq!(
+            parse_iso_lenient("2026-11-06T08:51:01+07:00"),
+            Some(1793955061 - 7 * 3600)
+        );
     }
 
     #[test]
