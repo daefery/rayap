@@ -466,11 +466,22 @@ impl FetchBudget {
         let Some(limit) = self.limit else {
             return true;
         };
-        self.taken
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < limit).then_some(n + 1)
-            })
-            .is_ok()
+        // Compare-and-swap loop: take one unit unless the limit is reached.
+        let mut current = self.taken.load(Ordering::SeqCst);
+        loop {
+            if current >= limit {
+                return false;
+            }
+            match self.taken.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
