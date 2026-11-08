@@ -288,6 +288,18 @@ What this shows:
   repeated after a load spike doubled its wall time; both files are kept), and every page
   now also produces a `page` record with its visible text, which is more work per outcome
   than the 6 Nov build did. The within-table comparison is like for like.
+- **Run-to-run noise on this laptop is large.** The same commands repeated the same
+  afternoon (`lighter-writes-*` in `results/2026-11-08/`, after unchanged pages stopped
+  rewriting records and text was reduced to main content) gave 1,190/s at 1 shard and
+  2,609/s at 4 shards on 20k hosts, while the simulator's own CPU for identical work was
+  30–50% higher than in the morning: the machine, not the crawler, was slower. A
+  before/after claim for those write changes needs alternating pairs on a quiet machine,
+  as was done for batched commits; until then none is made.
+- **Where the single-shard CPU goes** (`flamegraph`, 1 shard, 10k, 8 Nov): HTML extraction
+  36% of samples (whitespace collapsing alone 21% before it was made single-pass), the
+  store writer 27% (SQLite `step` 5%, JSON serialisation of records 6%, `complete_in` 14%),
+  HTTP client 7%. Extraction runs in the fetch tasks, so it spreads across cores; the
+  writer does not.
 
 ## What breaks first
 
