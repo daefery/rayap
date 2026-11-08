@@ -11,8 +11,21 @@ use crate::{Error, Result, urlnorm};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub crawler: CrawlerConfig,
+    /// Sign every request (Web Bot Auth, RFC 9421 + Ed25519) so sites can verify it is rayap.
+    #[serde(default)]
+    pub signing: Option<SigningConfig>,
     #[serde(rename = "source", default)]
     pub sources: Vec<Source>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigningConfig {
+    /// File holding the Ed25519 seed: 32 raw bytes or their base64. `rayap key new` makes one.
+    pub key_file: String,
+    /// https URL whose `/.well-known/http-message-signatures-directory` serves the public key
+    /// (`rayap key directory` prints the document). Sent as `Signature-Agent`.
+    pub agent: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +160,14 @@ impl Config {
         }
         if self.sources.is_empty() {
             return Err(Error::Config("add at least one [[source]]".into()));
+        }
+        if let Some(s) = &self.signing {
+            match url::Url::parse(&s.agent) {
+                Ok(u) if u.scheme() == "https" => {}
+                _ => {
+                    return Err(Error::Config("signing.agent must be an https URL".into()));
+                }
+            }
         }
         let mut names = HashSet::new();
         for source in &self.sources {

@@ -72,7 +72,13 @@ challenge pages, 2 s between requests ([bench/tiktok](bench/tiktok/README.md)).
   robots.txt and politeness checks for its own host. Chains stop after 10 hops, and links are
   only followed on the source's own host.
 - **Identifies itself**: `Mozilla/5.0 (compatible; rayap/0.1.0; +<your contact>)`. A contact
-  is required.
+  is required. With a `[signing]` section every request also carries Web Bot Auth headers
+  (RFC 9421 HTTP Message Signatures, Ed25519, `tag="web-bot-auth"`, covering `@authority`
+  and `Signature-Agent`), so a site can verify the request came from the holder of a key
+  published at `https://<your-domain>/.well-known/http-message-signatures-directory` rather
+  than trusting the User-Agent string. `rayap key new <file>` makes a key; `rayap key
+  directory -c rayap.toml` prints the JWK Set to publish. The signer reproduces the IETF
+  draft's test vector byte for byte (`signing.rs` tests).
 - **Public pages only**: no logins, forms or CAPTCHAs.
 - **Change detection ignores noise**: the fingerprint covers the page title and body text, not
   scripts, styles or markup, so a new tracking snippet is not a change.
@@ -261,7 +267,8 @@ forbid automated collection, so keep volume low and use it only where you have t
    sources in `examples/` and `bench/tiktok`, checked 7 Nov 2026, only one
    (andpurpose.world) sends a validator and answers 304; the rest send neither `ETag` nor
    `Last-Modified`, so conditional requests would save nothing there.
-4. Signed requests (RFC 9421 HTTP Message Signatures, Web Bot Auth), so sites can verify rayap.
+4. Signed-directory response (the optional signature over the JWK Set itself, for
+   redistributed keys) and `Accept-Signature` negotiation; request signing is in.
 
 ## License
 

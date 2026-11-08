@@ -16,6 +16,7 @@ pub mod html;
 pub mod render;
 pub mod revisit;
 pub mod robots;
+pub mod signing;
 pub mod store;
 pub mod tiktok;
 pub mod urlnorm;

@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::robots::MAX_ROBOTS_BYTES;
 use crate::store::NewRecord;
-use crate::{Config, Result, company, html, render, tiktok, urlnorm};
+use crate::{Config, Result, company, html, render, signing, tiktok, urlnorm};
 
 /// How a fetched body is read, decided by the source's kind.
 #[derive(Debug, Clone)]
@@ -28,6 +28,8 @@ pub struct Clients {
     http: Client,
     /// Present when a browser was found; `None` makes rendered sources fail loudly.
     browser: Option<render::Browser>,
+    /// Present when `[signing]` is configured: every HTTP request carries Web Bot Auth headers.
+    signer: Option<Arc<signing::Signer>>,
 }
 
 impl Clients {
@@ -52,7 +54,31 @@ impl Clients {
         } else {
             None
         };
-        Ok(Self { http, browser })
+        let signer = match &config.signing {
+            Some(s) => {
+                let agent =
+                    Url::parse(&s.agent).map_err(|e| crate::Error::Config(e.to_string()))?;
+                Some(Arc::new(signing::Signer::from_key_file(
+                    std::path::Path::new(&s.key_file),
+                    agent,
+                )?))
+            }
+            None => None,
+        };
+        Ok(Self {
+            http,
+            browser,
+            signer,
+        })
+    }
+
+    /// A GET for `url`, signed when signing is configured.
+    fn get(&self, url: &Url) -> reqwest::RequestBuilder {
+        let mut request = self.http.get(url.clone());
+        if let Some(signer) = &self.signer {
+            request = request.headers(signer.headers(url, SystemTime::now()));
+        }
+        request
     }
 
     pub fn browser(&self) -> Option<&render::Browser> {
@@ -146,7 +172,7 @@ pub async fn fetch_page(
             Err(reason) => PageResult::Network(reason),
         };
     }
-    let response = match clients.http.get(url.clone()).send().await {
+    let response = match clients.get(url).send().await {
         Ok(r) => r,
         Err(e) => return PageResult::Network(describe(&e)),
     };
@@ -281,7 +307,7 @@ pub async fn fetch_robots(clients: &Clients, url: &str) -> RobotsResult {
     let Ok(parsed) = Url::parse(url) else {
         return RobotsResult::Network(format!("invalid robots.txt URL {url}"));
     };
-    let response = match clients.http.get(parsed.clone()).send().await {
+    let response = match clients.get(&parsed).send().await {
         Ok(r) => r,
         Err(e) => return RobotsResult::Network(describe(&e)),
     };

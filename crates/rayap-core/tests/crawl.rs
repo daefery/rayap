@@ -34,6 +34,8 @@ enum Reply {
 struct Site {
     routes: Arc<Mutex<HashMap<String, Reply>>>,
     log: Arc<Mutex<Vec<(Instant, String, String)>>>,
+    /// Full request headers, in request order, for tests that inspect signatures.
+    headers: Arc<Mutex<Vec<HeaderMap>>>,
 }
 
 impl Site {
@@ -84,6 +86,7 @@ async fn serve(State(site): State<Site>, headers: HeaderMap, request: Request) -
         .lock()
         .unwrap()
         .push((Instant::now(), path.clone(), ua));
+    site.headers.lock().unwrap().push(headers.clone());
     let reply = site.routes.lock().unwrap().get(&path).cloned();
     match reply {
         None => StatusCode::NOT_FOUND.into_response(),
@@ -1481,4 +1484,75 @@ async fn a_rendered_source_runs_the_pages_javascript_first() {
     let agents = site.user_agents();
     assert!(agents.iter().all(|ua| ua.contains("rayap/")), "{agents:?}");
     assert_eq!(site.requests()[0], "/robots.txt");
+}
+
+#[tokio::test]
+async fn signed_requests_carry_web_bot_auth_headers_that_verify() {
+    use base64::Engine;
+    let site = Site::default();
+    site.set("/", Reply::Html("<main>hello</main>".into()));
+    let addr = start(site.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("rayap.key");
+    let seed = rayap_core::signing::Signer::generate_seed();
+    std::fs::write(
+        &key_path,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed),
+    )
+    .unwrap();
+    let cfg = Config::from_toml(&format!(
+        r#"
+        [crawler]
+        contact = "mailto:test@example.org"
+        per_host_delay_ms = 10
+        request_timeout_ms = 5000
+        [signing]
+        key_file = "{}"
+        agent = "https://crawler.example.org"
+        [[source]]
+        name = "s"
+        url = "http://{addr}/"
+        "#,
+        key_path.display()
+    ))
+    .unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(events[0].kind, EventKind::New);
+
+    // Every request, robots.txt included, is signed; verify one like a site would, using
+    // only the directory rayap publishes.
+    let signer = rayap_core::signing::Signer::new(
+        seed,
+        url::Url::parse("https://crawler.example.org").unwrap(),
+    )
+    .unwrap();
+    let directory = signer.directory();
+    let x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(directory["keys"][0]["x"].as_str().unwrap())
+        .unwrap();
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(x.as_slice().try_into().unwrap()).unwrap();
+    let all = site.headers.lock().unwrap().clone();
+    assert_eq!(all.len(), 2, "robots.txt and the page");
+    for h in &all {
+        assert_eq!(h["signature-agent"], "sig1=\"https://crawler.example.org\"");
+        let input = h["signature-input"].to_str().unwrap();
+        let params = input.strip_prefix("sig1=").unwrap();
+        assert!(params.contains(&format!(
+            "keyid=\"{}\"",
+            directory["keys"][0]["kid"].as_str().unwrap()
+        )));
+        assert!(params.contains("tag=\"web-bot-auth\""));
+        let base = format!(
+            "\"@authority\": {}\n\"signature-agent\";key=\"sig1\": \"https://crawler.example.org\"\n\"@signature-params\": {params}",
+            addr
+        );
+        let sig_field = h["signature"].to_str().unwrap();
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sig_field.trim_start_matches("sig1=:").trim_end_matches(':'))
+            .unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
+        vk.verify_strict(base.as_bytes(), &sig)
+            .expect("the site can verify rayap's signature");
+    }
 }

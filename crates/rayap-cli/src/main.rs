@@ -79,6 +79,11 @@ enum Command {
         #[arg(short, long, default_value = "rayap.toml")]
         config: PathBuf,
     },
+    /// Signing keys for Web Bot Auth (RFC 9421, Ed25519).
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
     /// Serve a read-only dashboard and JSON API over one or more crawl databases.
     Serve {
         /// A collection as `name=path/to.db`; repeat for several (e.g. grants=grants.db).
@@ -86,6 +91,17 @@ enum Command {
         collections: Vec<(String, PathBuf)>,
         #[arg(long, default_value = "127.0.0.1:8732")]
         listen: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyAction {
+    /// Generate a new Ed25519 seed and write it (base64url) to FILE. Refuses to overwrite.
+    New { file: PathBuf },
+    /// Print the JWK Set to serve at <agent>/.well-known/http-message-signatures-directory.
+    Directory {
+        #[arg(short, long, default_value = "rayap.toml")]
+        config: PathBuf,
     },
 }
 
@@ -150,6 +166,53 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
             {
                 write_record(&mut out, &record)?;
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Key {
+            action: KeyAction::New { file },
+        } => {
+            if file.exists() {
+                return Err(format!("{}: exists, not overwriting", file.display()));
+            }
+            use base64::Engine;
+            let seed = rayap_core::signing::Signer::generate_seed();
+            let text = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed);
+            std::fs::write(&file, format!("{text}\n"))
+                .map_err(|e| format!("{}: {e}", file.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+            }
+            eprintln!(
+                "rayap: wrote a new Ed25519 seed to {}. Keep it private; add to rayap.toml:\n[signing]\nkey_file = \"{}\"\nagent = \"https://your-domain.example\"",
+                file.display(),
+                file.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Key {
+            action: KeyAction::Directory { config },
+        } => {
+            let config = load(&config)?;
+            let Some(signing) = &config.signing else {
+                return Err("no [signing] section in the config".into());
+            };
+            let agent = url::Url::parse(&signing.agent).map_err(|e| e.to_string())?;
+            let signer = rayap_core::signing::Signer::from_key_file(
+                std::path::Path::new(&signing.key_file),
+                agent.clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            eprintln!(
+                "rayap: serve this as {}/.well-known/http-message-signatures-directory with\nContent-Type: application/http-message-signatures-directory+json (keyid {})",
+                agent.origin().ascii_serialization(),
+                signer.keyid()
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&signer.directory()).map_err(|e| e.to_string())?
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Serve {
