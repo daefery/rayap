@@ -98,7 +98,7 @@ enum Command {
 enum KeyAction {
     /// Generate a new Ed25519 seed and write it (base64url) to FILE. Refuses to overwrite.
     New { file: PathBuf },
-    /// Print the JWK Set to serve at <agent>/.well-known/http-message-signatures-directory.
+    /// Print the JWK Set to serve at AGENT/.well-known/http-message-signatures-directory.
     Directory {
         #[arg(short, long, default_value = "rayap.toml")]
         config: PathBuf,

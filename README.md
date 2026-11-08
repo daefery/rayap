@@ -1,53 +1,34 @@
 # rayap
 
-A polite, restartable web crawl engine in Rust.
+A polite, restartable web crawl engine in Rust, with a politeness referee that proves it.
 
-rayap crawls a list of sources and writes one JSON event per page: `new`, `changed`,
-`unchanged`, `rebaseline`, `redirect`, `gone`, `blocked` or `error`. Its state lives in SQLite, so an
-interrupted crawl resumes where it stopped and the next run reports only what changed.
+rayap crawls a list of sources and writes one JSON event per page (`new`, `changed`,
+`unchanged`, `rebaseline`, `redirect`, `gone`, `blocked`, `error`) plus structured records
+(page text, TikTok posts and comments, companies). State lives in SQLite: an interrupted
+crawl resumes where it stopped, and the next run reports only what changed. One binary,
+no services; a read-only dashboard and JSON API over the same file.
 
-> Status: early. The engine core and CLI work and are tested.
+> Status: early. Built in one week (6–8 Nov 2026) as a portfolio piece for web-crawling
+> infrastructure work. The engine and CLI are tested (141 tests); the numbers below are
+> measured and every one links to its raw file and command.
 
 ## Measured
 
-On a simulated web of 10,000 hosts with injected latency, errors, 429s, redirects and
-robots.txt rules, one rayap process on a laptop (i7-12650H, WSL2) fetched, parsed and
-committed to SQLite at:
+| Claim | Number | Where |
+|---|---|---|
+| Throughput, one process, 10,000 simulated hosts, 2 s per-host delay | **4,030 pages/s** steady, 1,730 over the whole crawl (6 Nov, median of 4) | [bench/README.md](bench/README.md#end-to-end-10000-hosts-4-runs-revision-2d0a321) |
+| Politeness, same crawl, judged by an independent TCP-level referee | **0 proven violations**; the referee catches a crawler set 10 ms too fast 92,057 times | [negative control](bench/README.md#setup) |
+| Batched commits (one transaction per drained batch) | **1.46x** steady throughput, 3 alternating pairs | [table](bench/README.md#a-second-optimisation-batched-commits-7-nov-2026) |
+| Sharded coordinators (`--shards N`, one store writer) | **1.79x** at 8 shards on 10k hosts; the 20k-host cliff is gone (1.45x at 4 shards) | [table](bench/README.md#sharded-coordinators-8-nov-2026) |
+| Revisit planner vs uniform polling, hidden change rates, oracle ceiling | **1.2–1.85x** changes caught per fetch; closes ~2/3 of the gap to the oracle; mean staleness 75 h → 28.5 h | [table](bench/README.md#revisit-scheduling-learned-change-rates-vs-uniform-polling-7-nov-2026) |
+| Real sites: 118 TikTok posts, 3 revisits | 115 posts + 4,465 comments; **98 of 205 "changed" comment pages were the same comments reordered** (fixed: set fingerprint); TikTok's 44 KB captcha page refused by the validator and backed off from | [bench/tiktok](bench/tiktok/README.md), [revisit](bench/tiktok/revisit/README.md) |
+| Real sites: 23 grant funders, 6 companies | 21 pages with readable text (two were JavaScript shells, reported as such); 5 `company` + 15 `company_page` records in 22 requests | [bench/grants](bench/grants/README.md), [examples/](examples/) |
 
-- **about 4,030 pages/s in the steady window** (median of 4 runs; one run slowed by other
-  load on the laptop is included and explained);
-- **about 1,730 pages/s over the whole crawl** (about 228 s), including the tail of slow
-  and Crawl-delayed hosts;
-- with a 2 s per-host delay and **zero politeness violations** proven by an independent
-  referee.
+100 million pages a day is 1,157 pages/s. The throughput numbers are a loopback
+simulation, not the public internet; [bench/README.md](bench/README.md) lists what the
+simulator does and does not model, and what breaks first now (the single store writer).
 
-The referee judges each response's end at the TCP level, from when the client
-acknowledges the last byte, and counts only violations it can prove. It catches a crawler
-set 10 ms too fast 92,057 times in the same crawl.
-
-100 million pages a day is 1,157 pages/s. This is a loopback simulation, not the public
-internet. [bench/README.md](bench/README.md) has:
-- the setup and every raw result with its command;
-- negative controls;
-- two before/after optimisations (extraction off the coordinator; batched commits, 1.46x);
-- a scaling table showing where one coordinator stops scaling (about 20,000 hosts), and
-  the sharded coordinators that remove that cliff (`--shards N`: 1.79x at 8 shards on
-  10,000 hosts, 1.45x at 4 shards on 20,000);
-- the limits, and what breaks first now (the single store writer).
-
-**Revisit scheduling.** Given a fixed budget of revisits, rayap's planner
-(`revisit.rs`) learns each page's change rate from its own visits and spends the budget
-where changes happen. On 20,000 simulated pages with hidden change rates, one revisit per
-page per 5 days, 70% of pages static: changes caught per 1,000 fetches 137 → 219
-(**1.6x**; an oracle that knows the true rates gets 255), freshness 0.913 → 0.947 (oracle
-0.966), mean staleness 75 h → 28.5 h. The gain is 1.2x to 1.85x across the workloads tried,
-never an order of magnitude; the table and the reasons are in
-[bench/README.md](bench/README.md#revisit-scheduling-learned-change-rates-vs-uniform-polling-7-nov-2026).
-`rayap crawl --budget N` uses it; see Revisits below.
-
-**Structured sources.** 118 public TikTok posts → 115 `post` and 4,072 `comment` records,
-three deleted or under-review posts reported as `gone` rather than stored as content, 0
-challenge pages, 2 s between requests ([bench/tiktok](bench/tiktok/README.md)).
+![rayap dashboard: grants collection, page records with main text](docs/dashboard.png)
 
 ## How it behaves
 
@@ -245,16 +226,23 @@ forbid automated collection, so keep volume low and use it only where you have t
 | Path | What |
 |---|---|
 | `crates/rayap-core/src/frontier.rs` | per-host queues and the earliest-eligible-host heap |
-| `crates/rayap-core/src/crawler.rs` | the crawl loop: scheduling, robots.txt gate, retries |
+| `crates/rayap-core/src/crawler.rs` | the crawl loop: sharded coordinators, robots.txt gate, retries, holds |
+| `crates/rayap-core/src/writer.rs` | the one task that writes the store; shards send it batches |
 | `crates/rayap-core/src/robots.rs` | RFC 9309 parser and matcher |
-| `crates/rayap-core/src/store.rs` | SQLite state, runs, resumable progress, events |
-| `crates/rayap-core/src/html.rs` | streaming extraction (title, text, links, nofollow) with `lol_html` |
-| `crates/rayap-core/src/tiktok.rs` | TikTok post and comment pages into `post` / `comment` records |
-| `crates/rayap-core/tests/crawl.rs` | end-to-end tests against a local server |
-| `crates/rayap-cli` | the `rayap` command |
-| `crates/rayap-serve` | `rayap serve`: read-only JSON API and the one-file dashboard |
-| `crates/rayap-sim` | simulated web plus an independent politeness referee |
-| `crates/rayap-bench` | end-to-end and scheduler-only benchmarks, with flamegraphs |
+| `crates/rayap-core/src/store.rs` | SQLite state: runs, pages, events, records, revisits, holds; planned runs |
+| `crates/rayap-core/src/revisit.rs` | change-rate estimation and budget allocation (Cho & Garcia-Molina) |
+| `crates/rayap-core/src/fetch.rs` | HTTP and browser routes, extractors, the 2xx validator |
+| `crates/rayap-core/src/html.rs` | streaming main-content extraction with `lol_html` |
+| `crates/rayap-core/src/tiktok.rs`, `company.rs` | structured sources: records from posts/comments and company sites |
+| `crates/rayap-core/src/render.rs` | headless Chrome route for JavaScript pages |
+| `crates/rayap-core/src/signing.rs` | Web Bot Auth request signing (RFC 9421, Ed25519) |
+| `crates/rayap-core/tests/crawl.rs` | 29 end-to-end tests against a local server, run at 1 and N shards |
+| `crates/rayap-cli` | the `rayap` command: `crawl`, `events`, `records`, `rates`, `serve`, `key`, `check` |
+| `crates/rayap-serve` | read-only JSON API and the one-file dashboard |
+| `crates/rayap-sim` | simulated web plus the independent politeness referee |
+| `crates/rayap-bench` | end-to-end, scheduler-only and revisit benchmarks, with flamegraphs |
+| `bench/` | every measurement, its command and its raw JSON |
+| `examples/` | grant funders, companies, and the Lampalampa sources |
 
 ## Roadmap
 

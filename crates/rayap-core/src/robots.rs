@@ -1,4 +1,4 @@
-//! robots.txt per RFC 9309 (https://www.rfc-editor.org/rfc/rfc9309.html).
+//! robots.txt per RFC 9309 (<https://www.rfc-editor.org/rfc/rfc9309.html>).
 //!
 //! - Group selection: every group whose user-agent matches our product token
 //!   (case-insensitive) is combined; if none matches, every `*` group is combined; otherwise
