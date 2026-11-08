@@ -30,8 +30,10 @@ internet. [bench/README.md](bench/README.md) has:
 - the setup and every raw result with its command;
 - negative controls;
 - two before/after optimisations (extraction off the coordinator; batched commits, 1.46x);
-- a scaling table showing where one coordinator stops scaling (about 20,000 hosts);
-- the limits.
+- a scaling table showing where one coordinator stops scaling (about 20,000 hosts), and
+  the sharded coordinators that remove that cliff (`--shards N`: 1.79x at 8 shards on
+  10,000 hosts, 1.45x at 4 shards on 20,000);
+- the limits, and what breaks first now (the single store writer).
 
 **Revisit scheduling.** Given a fixed budget of revisits, rayap's planner
 (`revisit.rs`) learns each page's change rate from its own visits and spends the budget
@@ -50,7 +52,8 @@ challenge pages, 2 s between requests ([bench/tiktok](bench/tiktok/README.md)).
 ## How it behaves
 
 - **One request at a time per host**, with a configurable delay between requests
-  (default 2 s). A slow or rate-limited host never holds up the others: hosts wait in a
+  (default 2 s). `--shards N` splits hosts across N coordinators by host name; a host
+  always belongs to exactly one, so the rule holds without locks. A slow or rate-limited host never holds up the others: hosts wait in a
   min-heap keyed by the time they may next be contacted.
 - **robots.txt per RFC 9309**, with rayap's own parser: fetched before any page on an
   origin, cached at most 24 hours, first 500 KiB parsed. Groups for the `rayap` product token
@@ -216,8 +219,8 @@ forbid automated collection, so keep volume low and use it only where you have t
 1. Measure new comments per KB: planned vs visit-everything revisits a day apart on posts
    that still receive comments (the planner and the activity-gated comment pages are in;
    the windows tried so far had no new comments in either arm).
-2. Several coordinators sharded by host, to scale past one coordinator (batched commits
-   are in; see "What breaks first" in the benchmark).
+2. Cheaper writes and, when needed, one database per shard: with `--shards` in, the single
+   store writer is what caps throughput (see "What breaks first" in the benchmark).
 3. Conditional requests (`If-None-Match`, `If-Modified-Since`). Deferred: of the 7 real
    sources in `examples/` and `bench/tiktok`, checked 7 Nov 2026, only one
    (andpurpose.world) sends a validator and answers 304; the rest send neither `ETag` nor

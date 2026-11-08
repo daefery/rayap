@@ -253,20 +253,61 @@ What this shows:
   fingerprints can flap on noisy pages, which would inflate estimated rates. The planner is
   not wired into the crawl loop yet (`rayap crawl` still visits every source each run).
 
+### Sharded coordinators (8 Nov 2026)
+
+`--shards N` splits hosts across N coordinators by a hash of the host name. Each owns the
+frontier, robots.txt cache and holds for its hosts, so the politeness rules need no locks;
+one writer task owns the SQLite file and commits each shard's batches; a shard delivers
+events and hands cross-host pages to their owner only after its batch is acknowledged.
+Files in [`results/2026-11-08/`](results/2026-11-08/), commands in
+[`RUN.md`](results/2026-11-08/RUN.md). Same simulator, referee and machine as above, quiet
+(load 0.8–2.3); every run finished with 0 proven and 0 uncertain violations.
+
+| Hosts | Shards | Steady pages/s | vs 1 shard | Whole run pages/s | Seconds to 90% | Crawler cores (steady) | Busy per shard |
+|---|---|---|---|---|---|---|---|
+| 10,000 | 1 | 1,727 | | 962 | 323 | 1.00 | 1.03 |
+| 10,000 | 2 | 2,252 | 1.30x | 1,133 | 254 | 1.30 | 1.00 |
+| 10,000 | 4 | 2,737 | 1.58x | 1,302 | 202 | 1.42 | 1.02 |
+| 10,000 | 8 | 3,086 | 1.79x | 1,244 | 215 | 1.76 | 1.14 |
+| 20,000 | 1 | 1,558 | | 936 | 736 | 1.09 | 1.02 |
+| 20,000 | 4 | 2,259 | 1.45x | 1,274 | 512 | 1.45 | 1.04 |
+
+What this shows:
+
+- **Shards scale, sub-linearly.** 8 shards give 1.79x on 10,000 hosts and use 1.76 cores.
+  Every shard is still busy ~100% of its own time, so the shards are not idle; they are
+  waiting on the one writer, whose acknowledgement each batch needs before its pages can
+  be handed over and its host released into the next pass. The writer is now "what breaks
+  first" (below).
+- **The 20,000-host cliff is gone.** With one coordinator, 20,000 hosts ran slower than
+  10,000 (1,558 vs 1,727 steady, 736 vs 323 s to 90%); with 4 shards, 20,000 hosts run at
+  2,259/s. The cap from politeness at 2 s per host is 10,000/s here, so the engine is still
+  the limit, not the sites.
+- **These absolute rates are below the 6 Nov table** (4,030/s at 10,000 hosts). Two
+  reasons, both measured: the machine was not idle on 7–8 Nov (the 1-shard 10k run was
+  repeated after a load spike doubled its wall time; both files are kept), and every page
+  now also produces a `page` record with its visible text, which is more work per outcome
+  than the 6 Nov build did. The within-table comparison is like for like.
+
 ## What breaks first
 
-1. **The single coordinator.** One task schedules every request and commits every
-   outcome. In the steady window it is busy 30% of the time at 2,500 hosts, 85% at 10,000
-   and 99% at 20,000. Past that point, more hosts make it slower: 4,404 pages/s at 20,000
-   hosts and 3,606 at 40,000, against caps of 10,000 and 20,000. Next steps:
-   - commit outcomes in batches, one transaction per batch instead of per page;
-   - shard hosts across several coordinators. Hosts share no state, so they split cleanly.
+1. **The store writer.** One task applies every shard's writes to one SQLite file. With 8
+   shards on 10,000 hosts the crawler uses 1.76 cores for 3,086 pages/s and each shard
+   waits on acknowledgements. Next steps, in order:
+   - cheaper writes per page (the `page` text record is the largest; store it compressed
+     or only when the fingerprint changed);
+   - acknowledge a batch to the shard before the fsync, since the shard's own correctness
+     only needs ordering, not durability (events to the consumer still wait for durability);
+   - one database per shard, with `serve` and `events` reading several files. This removes
+     the ceiling and is what a real deployment would do; it costs the single-file simplicity.
+   The single coordinator is no longer first: hosts split across shards without sharing
+   state, and the 20,000-host cliff of the 6 Nov table is gone (see above).
 2. **Memory per URL queued.** Peak memory grows with the URLs known: 0.9 GiB at 10,000
    hosts, 4.5 GiB at 40,000. The frontier holds every pending URL as a string. A
    disk-backed frontier or interned URLs are needed long before a real-web crawl.
-3. **One SQLite file.** It held about 4,000 page outcomes per second here, each in its own
-   transaction (plus a small per-request host-hold write), with WAL and
-   `synchronous=NORMAL`. Durable to a power cut (`synchronous=FULL`) was not measured.
+3. **One SQLite file.** Batched commits (7 Nov) replaced one transaction per page with one
+   per drained batch; with WAL and `synchronous=NORMAL`. Durable to a power cut
+   (`synchronous=FULL`) was not measured. See 1.
 
 ## Limits
 
@@ -296,6 +337,8 @@ cargo build --release
 ./target/release/rayap-bench freshness --pages 20000 --days 60 --static-share 0.7 --log10-rate-max 0
 # negative control: crawler deliberately 10 ms too fast for the referee
 ./target/release/rayap-bench e2e --hosts 10000 --delay-ms 2000 --crawler-delay-ms 1990
+# four coordinators sharded by host
+./target/release/rayap-bench e2e --hosts 20000 --delay-ms 2000 --concurrency 8192 --shards 4
 # with a CPU flamegraph
 ./target/release/rayap-bench e2e --hosts 10000 --flamegraph flamegraph.svg
 # simulator options
