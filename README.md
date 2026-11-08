@@ -127,8 +127,13 @@ search the text), **Events** (the change log). The same data as JSON:
 `/api/collections`, `/api/{c}/pages?q=`, `/api/{c}/records?q=&kind=`, `/api/{c}/events?after=`.
 The server only reads; `rayap crawl` can write to the same file meanwhile.
 
-Every HTML page's visible text is stored as a `page` record (up to 200 KB, marked
-`truncated` beyond that), so a `changed` event can be read, not only noticed.
+Every HTML page's main-content text is stored as a `page` record (up to 200 KB, marked
+`truncated` beyond that), so a `changed` event can be read, not only noticed. Site chrome
+(navigation, header, footer, asides, inline SVG) is left out, and a page that marks a
+`main` or `article` region keeps only that; on the 21 grant pages this cut stored text by
+19% and the records now start with the call, not the menu. A page with no readable text
+at all (a JavaScript application shell) is an `error`, never fingerprinted; two of the real
+example sources turned out to be such shells. An `unchanged` page writes no records.
 
 ### Watching grant pages
 
@@ -152,6 +157,21 @@ feed URLs redirect to login, company post pages return 403. rayap's robots.txt g
 every LinkedIn URL before any page request, which is the correct behaviour. The routes that
 exist are their crawl whitelist, the official APIs for a page you own, or a page you control
 where people post the links.
+
+### Structured sources: companies
+
+`kind = "company"` reads an organisation's public website: the homepage becomes one
+`company` record (name, legal name and logo from JSON-LD `Organization` when present,
+description from meta tags, type, the well-known pages it links, its official social
+profiles, and its main text), and each well-known page it links (about, careers, contact,
+blog/news, products) becomes a `company_page` record with that page's text. Revisits
+report which of those changed: a new role on the careers page, a new post, a changed
+description. `examples/companies.toml` has six; on 8 Nov 2026 it produced 5 `company`
+and 15 `company_page` records in 22 requests (one blocked: mozillafoundation.org's
+robots.txt does not answer from this network).
+
+Organisation-level, public facts only. The extractor does not look for people, personal
+email addresses or phone numbers, and it records social profile URLs without visiting them.
 
 ### Structured sources: TikTok posts
 

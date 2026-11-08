@@ -1,0 +1,37 @@
+# Organisations' public websites: a `company` record each, plus `company_page` records for
+# the about / careers / contact / blog / products pages they link. Organisation-level facts
+# only; rayap does not look for people or personal contact details.
+
+[crawler]
+contact = "https://github.com/daefery/rayap"
+per_host_delay_ms = 3000
+
+[[source]]
+name = "exa"
+url = "https://exa.ai/"
+kind = "company"
+
+[[source]]
+name = "sovereign-tech"
+url = "https://www.sovereign.tech/"
+kind = "company"
+
+[[source]]
+name = "nlnet"
+url = "https://nlnet.nl/"
+kind = "company"
+
+[[source]]
+name = "solve-education"
+url = "https://www.solveeducation.org/"
+kind = "company"
+
+[[source]]
+name = "firecrawl"
+url = "https://www.firecrawl.dev/"
+kind = "company"
+
+[[source]]
+name = "mozilla-foundation"
+url = "https://foundation.mozilla.org/"
+kind = "company"

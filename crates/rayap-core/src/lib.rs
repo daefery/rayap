@@ -7,6 +7,7 @@
 //! `unchanged`, `redirect`, `gone`, `blocked`, `error`). Sources with a structured kind
 //! (`tiktok`) also yield records (`post`, `comment`) committed with the event.
 
+pub mod company;
 pub mod config;
 pub mod crawler;
 mod fetch;

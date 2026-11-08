@@ -74,6 +74,9 @@ pub enum SourceKind {
     Page,
     /// A public TikTok post (`/@handle/video/<id>`): `post` and `comment` records.
     Tiktok,
+    /// An organisation's website: a `company` record from the homepage and a `company_page`
+    /// record for each well-known page it links (about, careers, contact, blog, products).
+    Company,
 }
 
 fn default_max_comments() -> u32 {

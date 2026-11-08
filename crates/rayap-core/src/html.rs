@@ -39,10 +39,10 @@ pub struct Extract {
 struct State {
     title: String,
     title_done: bool,
-    /// All content text, used when the page has no main region.
-    text: String,
-    /// Text inside the main region only.
-    main_text: String,
+    /// All content text, whitespace already collapsed, used when the page has no main region.
+    text: Collapsed,
+    /// Text inside the main region only, collapsed.
+    main_text: Collapsed,
     /// How many chrome elements enclose the current position (text there is dropped).
     chrome_depth: u32,
     /// How many main-region elements enclose the current position.
@@ -158,11 +158,9 @@ pub fn extract(html: &str, page_url: &Url, product_token: &str) -> Extract {
                     if s.chrome_depth > 0 {
                         return Ok(());
                     }
-                    s.text.push_str(chunk.as_str());
-                    s.text.push(' ');
+                    s.text.push(chunk.as_str());
                     if s.main_depth > 0 {
-                        s.main_text.push_str(chunk.as_str());
-                        s.main_text.push(' ');
+                        s.main_text.push(chunk.as_str());
                     }
                 }
                 Ok(())
@@ -195,12 +193,14 @@ pub fn extract(html: &str, page_url: &Url, product_token: &str) -> Extract {
     }
     let title = collapse(&decode_basic_entities(&state.title));
     // A marked main region wins, unless it turned out empty (a shell with an empty <main>).
-    let main_text = collapse(&decode_basic_entities(&state.main_text));
+    // Entities are decoded after collapsing: a decoded entity may be a space, which is why
+    // the result is trimmed, but nothing else about whitespace changes.
+    let main_text = decode_basic_entities(state.main_text.finish());
     let has_main = state.saw_main && !main_text.is_empty();
     let text = if has_main {
         main_text
     } else {
-        collapse(&decode_basic_entities(&state.text))
+        decode_basic_entities(state.text.finish())
     };
     Extract {
         title: (!title.is_empty()).then_some(title),
@@ -219,6 +219,53 @@ impl Extract {
             self.text
         )
         .into_bytes()
+    }
+}
+
+/// Text with whitespace runs collapsed to one space as it is appended, so a page is scanned
+/// once. ASCII whitespace is handled bytewise (the common case); other Unicode whitespace is
+/// handled when a chunk contains non-ASCII bytes.
+#[derive(Default, Clone)]
+struct Collapsed {
+    out: String,
+    pending_space: bool,
+}
+
+impl Collapsed {
+    fn push(&mut self, chunk: &str) {
+        if chunk.is_ascii() {
+            for &b in chunk.as_bytes() {
+                if b.is_ascii_whitespace() {
+                    self.pending_space = !self.out.is_empty();
+                } else {
+                    if self.pending_space {
+                        self.out.push(' ');
+                        self.pending_space = false;
+                    }
+                    self.out.push(b as char);
+                }
+            }
+        } else {
+            for ch in chunk.chars() {
+                if ch.is_whitespace() {
+                    self.pending_space = !self.out.is_empty();
+                } else {
+                    if self.pending_space {
+                        self.out.push(' ');
+                        self.pending_space = false;
+                    }
+                    self.out.push(ch);
+                }
+            }
+        }
+        // A chunk boundary separates words even without whitespace in the markup (`<b>a</b>b`
+        // renders as "ab", but adjacent block elements render apart); one space is the safe,
+        // stable choice and matches the previous behaviour of appending ' ' per chunk.
+        self.pending_space = !self.out.is_empty();
+    }
+
+    fn finish(&self) -> &str {
+        &self.out
     }
 }
 
@@ -244,6 +291,10 @@ fn collapse(s: &str) -> String {
 /// fingerprint the same: the named ones below and any numeric reference (`&#8211;`,
 /// `&#x2F;`). Other named entities are kept as written. One pass; `&amp;lt;` becomes `&lt;`
 /// (decoded once), as a browser shows it.
+pub fn decode_entities(s: &str) -> String {
+    decode_basic_entities(s)
+}
+
 fn decode_basic_entities(s: &str) -> String {
     const ENTITIES: [(&str, char); 6] = [
         ("&nbsp;", ' '),

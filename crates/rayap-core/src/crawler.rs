@@ -260,6 +260,10 @@ pub async fn crawl<F: FnMut(&Event)>(
             SourceKind::Tiktok => Extractor::Tiktok {
                 max_comments: source.max_comments,
             },
+            SourceKind::Company => Extractor::Company {
+                home: url.clone(),
+                product_token: config.crawler.product_token.clone(),
+            },
         };
         extractors.insert(source.name.clone(), extractor);
         let seed = NewPage {

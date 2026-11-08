@@ -1338,3 +1338,92 @@ async fn a_javascript_shell_is_an_error_not_content() {
         "only the real page has a record"
     );
 }
+
+#[tokio::test]
+async fn company_source_records_the_organisation_and_its_well_known_pages() {
+    let site = Site::default();
+    site.set(
+        "/",
+        Reply::Html(
+            r#"<html><head><title>Acme</title><meta name="description" content="We make anvils"></head>
+            <body><nav><a href="/about">About</a><a href="/careers">Careers</a><a href="/blog">Blog</a></nav>
+            <main><p>Anvils since 1920.</p></main>
+            <footer><a href="https://www.linkedin.com/company/acme">LinkedIn</a></footer></body></html>"#
+                .into(),
+        ),
+    );
+    site.set(
+        "/about",
+        Reply::Html("<main><p>Founded in Jakarta.</p></main>".into()),
+    );
+    site.set(
+        "/careers",
+        Reply::Html("<main><p>Open role: Rust engineer.</p></main>".into()),
+    );
+    site.set("/blog", Reply::Html("<main><p>Post one.</p></main>".into()));
+    let addr = start(site.clone()).await;
+    let cfg = Config::from_toml(&format!(
+        r#"
+        [crawler]
+        contact = "mailto:test@example.org"
+        per_host_delay_ms = 10
+        request_timeout_ms = 5000
+        [[source]]
+        name = "acme"
+        url = "http://{addr}/"
+        kind = "company"
+        "#
+    ))
+    .unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    let (stats, events) = run(&cfg, &mut store, Options::default()).await;
+    assert!(stats.finished);
+    assert_eq!(
+        stats.requests,
+        4,
+        "home + 3 well-known pages: {:?}",
+        kinds(&events)
+    );
+    let company = store.records_after(0, Some("company"), 10).unwrap();
+    assert_eq!(company.len(), 1);
+    let c = &company[0].data;
+    assert_eq!(c["name"], "Acme");
+    assert_eq!(c["description"], "We make anvils");
+    assert_eq!(c["text"], "Anvils since 1920.");
+    assert_eq!(
+        c["social"]["linkedin"],
+        "https://www.linkedin.com/company/acme"
+    );
+    assert_eq!(c["pages"].as_object().unwrap().len(), 3);
+    let pages = store.records_after(0, Some("company_page"), 10).unwrap();
+    let mut roles: Vec<&str> = pages
+        .iter()
+        .map(|p| p.data["role"].as_str().unwrap())
+        .collect();
+    roles.sort();
+    assert_eq!(roles, ["about", "blog", "careers"]);
+    let careers = pages.iter().find(|p| p.data["role"] == "careers").unwrap();
+    assert_eq!(careers.data["text"], "Open role: Rust engineer.");
+
+    // Second visit: the careers page gains a role, everything else is unchanged; only the
+    // careers record is rewritten.
+    site.set(
+        "/careers",
+        Reply::Html("<main><p>Open role: Rust engineer. Open role: Go engineer.</p></main>".into()),
+    );
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    let changed: Vec<&str> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Changed)
+        .map(|e| e.url.as_str())
+        .collect();
+    assert_eq!(changed.len(), 1);
+    assert!(changed[0].ends_with("/careers"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::Unchanged)
+            .count(),
+        3
+    );
+}

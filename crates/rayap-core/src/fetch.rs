@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::robots::MAX_ROBOTS_BYTES;
 use crate::store::NewRecord;
-use crate::{Config, Result, html, tiktok, urlnorm};
+use crate::{Config, Result, company, html, tiktok, urlnorm};
 
 /// How a fetched body is read, decided by the source's kind.
 #[derive(Debug, Clone)]
@@ -20,6 +20,8 @@ pub enum Extractor {
     Page { product_token: String },
     /// TikTok post and comment pages into records.
     Tiktok { max_comments: u32 },
+    /// A company website: homepage, then its well-known pages.
+    Company { home: Url, product_token: String },
 }
 
 pub struct Clients {
@@ -149,6 +151,38 @@ pub async fn fetch_page(
                             next: Vec::new(),
                             activity: None,
                             records: digested.record.into_iter().collect(),
+                            etag,
+                            last_modified,
+                        }
+                    }
+                    Extractor::Company {
+                        home,
+                        product_token,
+                    } => {
+                        let out = company::extract(url, home, &body, product_token);
+                        let text_len = out
+                            .records
+                            .first()
+                            .map_or(0, |r| r.data["text"].as_str().map_or(0, str::len));
+                        if text_len == 0 {
+                            keep_invalid_body(url, &body);
+                            return PageResult::Invalid {
+                                status,
+                                bytes: body.len(),
+                                reason: Invalid::Error(
+                                    "no visible text (JavaScript application shell)".into(),
+                                ),
+                            };
+                        }
+                        PageResult::Body {
+                            status,
+                            bytes: body.len(),
+                            title: None,
+                            hash: fingerprint(company::FINGERPRINT_VERSION, &out.fingerprint),
+                            links: Vec::new(),
+                            next: out.next,
+                            activity: None,
+                            records: out.records,
                             etag,
                             last_modified,
                         }
