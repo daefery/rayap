@@ -28,6 +28,10 @@ no services; a read-only dashboard and JSON API over the same file.
 simulation, not the public internet; [bench/README.md](bench/README.md) lists what the
 simulator does and does not model, and what breaks first now (the single store writer).
 
+[**docs/write-up.md**](docs/write-up.md) tells the three findings behind these numbers in
+1,400 words: proving politeness instead of claiming it, the planner's honest multiplier,
+and what real sites did to the engine.
+
 ![rayap dashboard: grants collection, page records with main text](docs/dashboard.png)
 
 ## How it behaves
