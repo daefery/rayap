@@ -122,11 +122,17 @@ impl Writer {
 
     /// Resolves once everything this handle sent before is committed.
     pub async fn flush(&self) -> Result<()> {
-        let (reply, answer) = oneshot::channel();
-        self.send(Command::Flush { reply })?;
-        answer
+        self.request_flush()?
             .await
             .map_err(|_| Error::Task("store writer dropped a reply".into()))?
+    }
+
+    /// Asks for a commit and returns the acknowledgement to await later, so the caller can
+    /// keep working while the writer commits.
+    pub fn request_flush(&self) -> Result<oneshot::Receiver<Result<()>>> {
+        let (reply, answer) = oneshot::channel();
+        self.send(Command::Flush { reply })?;
+        Ok(answer)
     }
 }
 

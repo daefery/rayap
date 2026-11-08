@@ -195,6 +195,16 @@ struct Crawler<'a> {
     routing: Routing,
     /// Pages discovered here that belong to another shard, sent after the batch commits.
     outbound: Vec<NewPage>,
+    /// Batches sent to the writer whose commit has not been acknowledged yet, oldest first.
+    /// The shard keeps scheduling while these are in flight; each is delivered when its
+    /// acknowledgement arrives.
+    in_commit: std::collections::VecDeque<InCommit>,
+}
+
+struct InCommit {
+    ack: tokio::sync::oneshot::Receiver<Result<()>>,
+    events: Vec<Event>,
+    outbound: Vec<NewPage>,
 }
 
 /// How hosts map to shards, and the shared count of idle shards used to agree on the end.
@@ -501,6 +511,7 @@ async fn run_shard(setup: ShardSetup) -> Result<ShardOutcome> {
         pending_events: Vec::new(),
         routing,
         outbound: Vec::new(),
+        in_commit: std::collections::VecDeque::new(),
     };
     for (host, wait) in holds {
         crawler.frontier.hold(&host, deadline(now, wait), now);
@@ -589,11 +600,14 @@ async fn run_shard(setup: ShardSetup) -> Result<ShardOutcome> {
                 Step::Again => {}
             }
         }
-        // Pages settled without a request (robots.txt blocks) are committed and delivered.
-        crawler.flush(&events).await?;
+        // Pages settled without a request (robots.txt blocks) go to the writer too.
+        crawler.request_commit()?;
+        crawler.deliver_acknowledged(&events)?;
 
         let too_far = wake.is_some_and(|at| at > Instant::now() + config.max_wait());
-        let idle = crawler.in_flight == 0 && (wake.is_none() || too_far || budget.spent());
+        let idle = crawler.in_flight == 0
+            && crawler.in_commit.is_empty()
+            && (wake.is_none() || too_far || budget.spent());
         if idle {
             // Nothing in flight and nothing to do soon here. Another shard may still hand us
             // a page, so the run ends only when every shard is idle. Marking idle first and
@@ -641,12 +655,20 @@ async fn run_shard(setup: ShardSetup) -> Result<ShardOutcome> {
                     crawler.handle(done).await?;
                     batched += 1;
                 }
-                crawler.flush(&events).await?;
+                crawler.request_commit()?;
+                crawler.deliver_acknowledged(&events)?;
                 let busy = started.elapsed();
                 crawler.stats.coordinator_busy += busy;
                 if let Some(counter) = &busy_micros {
                     counter.fetch_add(busy.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+            }
+            ack = async { (&mut crawler.in_commit.front_mut().expect("guarded").ack).await }, if !crawler.in_commit.is_empty() => {
+                // The oldest batch is committed: deliver its events and hand over its pages.
+                let batch = crawler.in_commit.pop_front().expect("guarded");
+                ack.map_err(|_| Error::Task("store writer dropped a reply".into()))??;
+                crawler.deliver(batch, &events);
+                crawler.deliver_acknowledged(&events)?;
             }
             Some(page) = inbox.recv() => {
                 // A page another shard found on one of our hosts. It is already in the store.
@@ -1263,17 +1285,46 @@ impl Crawler<'_> {
         Ok(())
     }
 
-    /// Waits for the writer to commit everything this shard sent, then delivers the batch's
-    /// events and hands cross-shard pages to their owners.
-    async fn flush(&mut self, events: &mpsc::UnboundedSender<Event>) -> Result<()> {
+    /// Sends a commit request for everything this shard recorded since the last one. The
+    /// batch is delivered (events to the consumer, cross-shard pages to their owners) when
+    /// the writer acknowledges it; meanwhile the shard keeps scheduling.
+    fn request_commit(&mut self) -> Result<()> {
         if self.pending_events.is_empty() && self.outbound.is_empty() {
             return Ok(());
         }
-        self.writer.flush().await?;
-        for event in self.pending_events.drain(..) {
+        let ack = self.writer.request_flush()?;
+        self.in_commit.push_back(InCommit {
+            ack,
+            events: std::mem::take(&mut self.pending_events),
+            outbound: std::mem::take(&mut self.outbound),
+        });
+        Ok(())
+    }
+
+    /// Delivers every batch whose commit has already been acknowledged, oldest first, without
+    /// waiting. Called on every pass so acknowledgements never queue up behind new fetches.
+    fn deliver_acknowledged(&mut self, events: &mpsc::UnboundedSender<Event>) -> Result<()> {
+        while let Some(front) = self.in_commit.front_mut() {
+            match front.ack.try_recv() {
+                Ok(result) => {
+                    result?;
+                    let batch = self.in_commit.pop_front().expect("front exists");
+                    self.deliver(batch, events);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    return Err(Error::Task("store writer dropped a reply".into()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deliver(&mut self, batch: InCommit, events: &mpsc::UnboundedSender<Event>) {
+        for event in batch.events {
             let _ = events.send(event);
         }
-        for p in self.outbound.drain(..) {
+        for p in batch.outbound {
             let Ok(parsed) = Url::parse(&p.url) else {
                 continue;
             };
@@ -1283,7 +1334,6 @@ impl Crawler<'_> {
             // the store and the next run picks them up.
             let _ = self.routing.handover[owner].send(p);
         }
-        Ok(())
     }
 
     /// Queues a page another shard handed over.
