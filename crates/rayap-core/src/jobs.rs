@@ -513,7 +513,7 @@ mod tests {
         );
         assert_eq!(r.data["eligible_from"]["eligible"], true);
         assert_eq!(r.data["salary"], "40000–60000 USD year");
-        assert_eq!(r.data["excerpt"], "Design things .".replace(" .", " ."));
+        assert_eq!(r.data["excerpt"], "Design things .");
         assert_eq!(
             out.records[1].data["url"],
             "https://himalayas.app/companies/retailnext/jobs/sales-ops"
