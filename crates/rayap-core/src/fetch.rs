@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::robots::MAX_ROBOTS_BYTES;
 use crate::store::NewRecord;
-use crate::{Config, Result, company, html, tiktok, urlnorm};
+use crate::{Config, Result, company, html, render, tiktok, urlnorm};
 
 /// How a fetched body is read, decided by the source's kind.
 #[derive(Debug, Clone)]
@@ -26,6 +26,8 @@ pub enum Extractor {
 
 pub struct Clients {
     http: Client,
+    /// Present when a browser was found; `None` makes rendered sources fail loudly.
+    browser: Option<render::Browser>,
 }
 
 impl Clients {
@@ -42,7 +44,19 @@ impl Clients {
             // politeness and robots.txt checks as any other request.
             .redirect(redirect::Policy::none())
             .build()?;
-        Ok(Self { http })
+        let browser = if config.sources.iter().any(|s| s.render) {
+            render::Browser::find(
+                &config.user_agent(),
+                config.request_timeout().max(Duration::from_secs(30)),
+            )
+        } else {
+            None
+        };
+        Ok(Self { http, browser })
+    }
+
+    pub fn browser(&self) -> Option<&render::Browser> {
+        self.browser.as_ref()
     }
 }
 
@@ -113,7 +127,25 @@ pub async fn fetch_page(
     url: &Url,
     max_body: usize,
     extractor: &Extractor,
+    rendered: bool,
 ) -> PageResult {
+    if rendered {
+        // The browser route: it fetches, follows redirects and runs scripts itself; what
+        // comes back is the DOM, digested exactly like an HTTP body with status 200.
+        let Some(browser) = clients.browser() else {
+            return PageResult::Network(
+                "render: no Chromium or Chrome found on PATH (set RAYAP_BROWSER)".into(),
+            );
+        };
+        return match browser.render(url).await {
+            Ok(dom) if dom.len() > max_body => PageResult::TooLarge {
+                status: 200,
+                limit: max_body,
+            },
+            Ok(dom) => digest_body(url, 200, true, None, None, dom, extractor),
+            Err(reason) => PageResult::Network(reason),
+        };
+    }
     let response = match clients.http.get(url.clone()).send().await {
         Ok(r) => r,
         Err(e) => return PageResult::Network(describe(&e)),
@@ -127,93 +159,9 @@ pub async fn fetch_page(
             let etag = header(headers, ETAG.as_str());
             let last_modified = header(headers, LAST_MODIFIED.as_str());
             match read_limited(response, max_body).await {
-                Ok(Some(body)) => match extractor {
-                    Extractor::Page { product_token } => {
-                        let digested = digest(&body, is_html, url, product_token);
-                        if is_html && digested.is_shell() {
-                            // HTML with no readable text at all: a JavaScript application
-                            // shell. Recording it would fingerprint an empty page as content.
-                            keep_invalid_body(url, &body);
-                            return PageResult::Invalid {
-                                status,
-                                bytes: body.len(),
-                                reason: Invalid::Error(
-                                    "no visible text (JavaScript application shell)".into(),
-                                ),
-                            };
-                        }
-                        PageResult::Body {
-                            status,
-                            bytes: body.len(),
-                            title: digested.title,
-                            hash: digested.hash,
-                            links: digested.links,
-                            next: Vec::new(),
-                            activity: None,
-                            records: digested.record.into_iter().collect(),
-                            etag,
-                            last_modified,
-                        }
-                    }
-                    Extractor::Company {
-                        home,
-                        product_token,
-                    } => {
-                        let out = company::extract(url, home, &body, product_token);
-                        let text_len = out
-                            .records
-                            .first()
-                            .map_or(0, |r| r.data["text"].as_str().map_or(0, str::len));
-                        if text_len == 0 {
-                            keep_invalid_body(url, &body);
-                            return PageResult::Invalid {
-                                status,
-                                bytes: body.len(),
-                                reason: Invalid::Error(
-                                    "no visible text (JavaScript application shell)".into(),
-                                ),
-                            };
-                        }
-                        PageResult::Body {
-                            status,
-                            bytes: body.len(),
-                            title: None,
-                            hash: fingerprint(company::FINGERPRINT_VERSION, &out.fingerprint),
-                            links: Vec::new(),
-                            next: out.next,
-                            activity: None,
-                            records: out.records,
-                            etag,
-                            last_modified,
-                        }
-                    }
-                    Extractor::Tiktok { max_comments } => {
-                        match tiktok::extract(url, &body, *max_comments) {
-                            Ok(out) => PageResult::Body {
-                                status,
-                                bytes: body.len(),
-                                title: None,
-                                hash: fingerprint(tiktok::FINGERPRINT_VERSION, &out.fingerprint),
-                                links: Vec::new(),
-                                next: out.next,
-                                activity: out
-                                    .activity
-                                    .map(|a| blake3::hash(&a).to_hex().to_string()),
-                                records: out.records,
-                                etag,
-                                last_modified,
-                            },
-                            Err(reason) => {
-                                keep_invalid_body(url, &body);
-                                PageResult::Invalid {
-                                    status,
-                                    bytes: body.len(),
-                                    reason,
-                                }
-                            }
-                        }
-                    }
-                },
+                Ok(Some(body)) => {
+                    digest_body(url, status, is_html, etag, last_modified, body, extractor)
+                }
                 Ok(None) => PageResult::TooLarge {
                     status,
                     limit: max_body,
@@ -235,6 +183,97 @@ pub async fn fetch_page(
             }
         }
         _ => PageResult::Status(status),
+    }
+}
+
+/// Runs the source's extractor over a 2xx body.
+fn digest_body(
+    url: &Url,
+    status: u16,
+    is_html: bool,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    body: Vec<u8>,
+    extractor: &Extractor,
+) -> PageResult {
+    match extractor {
+        Extractor::Page { product_token } => {
+            let digested = digest(&body, is_html, url, product_token);
+            if is_html && digested.is_shell() {
+                // HTML with no readable text at all: a JavaScript application
+                // shell. Recording it would fingerprint an empty page as content.
+                keep_invalid_body(url, &body);
+                return PageResult::Invalid {
+                    status,
+                    bytes: body.len(),
+                    reason: Invalid::Error("no visible text (JavaScript application shell)".into()),
+                };
+            }
+            PageResult::Body {
+                status,
+                bytes: body.len(),
+                title: digested.title,
+                hash: digested.hash,
+                links: digested.links,
+                next: Vec::new(),
+                activity: None,
+                records: digested.record.into_iter().collect(),
+                etag,
+                last_modified,
+            }
+        }
+        Extractor::Company {
+            home,
+            product_token,
+        } => {
+            let out = company::extract(url, home, &body, product_token);
+            let text_len = out
+                .records
+                .first()
+                .map_or(0, |r| r.data["text"].as_str().map_or(0, str::len));
+            if text_len == 0 {
+                keep_invalid_body(url, &body);
+                return PageResult::Invalid {
+                    status,
+                    bytes: body.len(),
+                    reason: Invalid::Error("no visible text (JavaScript application shell)".into()),
+                };
+            }
+            PageResult::Body {
+                status,
+                bytes: body.len(),
+                title: None,
+                hash: fingerprint(company::FINGERPRINT_VERSION, &out.fingerprint),
+                links: Vec::new(),
+                next: out.next,
+                activity: None,
+                records: out.records,
+                etag,
+                last_modified,
+            }
+        }
+        Extractor::Tiktok { max_comments } => match tiktok::extract(url, &body, *max_comments) {
+            Ok(out) => PageResult::Body {
+                status,
+                bytes: body.len(),
+                title: None,
+                hash: fingerprint(tiktok::FINGERPRINT_VERSION, &out.fingerprint),
+                links: Vec::new(),
+                next: out.next,
+                activity: out.activity.map(|a| blake3::hash(&a).to_hex().to_string()),
+                records: out.records,
+                etag,
+                last_modified,
+            },
+            Err(reason) => {
+                keep_invalid_body(url, &body);
+                PageResult::Invalid {
+                    status,
+                    bytes: body.len(),
+                    reason,
+                }
+            }
+        },
     }
 }
 

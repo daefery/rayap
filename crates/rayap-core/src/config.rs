@@ -64,6 +64,11 @@ pub struct Source {
     /// For `kind = "tiktok"`: comments to collect per post (rounded up to whole API pages).
     #[serde(default = "default_max_comments")]
     pub max_comments: u32,
+    /// Fetch this source's pages with a headless browser so their JavaScript runs first.
+    /// For pages that are an empty shell over plain HTTP. Needs Chromium or Chrome on PATH
+    /// (or `RAYAP_BROWSER`); without one the pages are reported as errors.
+    #[serde(default)]
+    pub render: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]

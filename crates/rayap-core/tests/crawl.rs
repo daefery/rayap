@@ -1427,3 +1427,58 @@ async fn company_source_records_the_organisation_and_its_well_known_pages() {
         3
     );
 }
+
+#[tokio::test]
+async fn a_rendered_source_runs_the_pages_javascript_first() {
+    // Skips itself when no browser is installed; rendering is optional.
+    if rayap_core::render::Browser::find("rayap/test", std::time::Duration::from_secs(30)).is_none()
+    {
+        eprintln!("no Chromium/Chrome on PATH; skipping render test");
+        return;
+    }
+    let site = Site::default();
+    // Over HTTP this is an empty shell; the script fills it in.
+    site.set(
+        "/",
+        Reply::Html(
+            r#"<!doctype html><html><head><title>Opps</title></head><body><main id="root"></main>
+            <script>document.getElementById('root').innerHTML = '<h1>Grant</h1><p>Deadline 1 Dec 2026</p>';</script>
+            </body></html>"#
+                .into(),
+        ),
+    );
+    let addr = start(site.clone()).await;
+    let cfg = |render: bool| {
+        Config::from_toml(&format!(
+            r#"
+            [crawler]
+            contact = "mailto:test@example.org"
+            per_host_delay_ms = 10
+            request_timeout_ms = 30000
+            [[source]]
+            name = "opps"
+            url = "http://{addr}/"
+            render = {render}
+            "#
+        ))
+        .unwrap()
+    };
+    let mut plain = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg(false), &mut plain, Options::default()).await;
+    assert_eq!(
+        events[0].kind,
+        EventKind::Error,
+        "plain HTTP sees a shell: {:?}",
+        events[0]
+    );
+
+    let mut rendered = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg(true), &mut rendered, Options::default()).await;
+    assert_eq!(events[0].kind, EventKind::New, "{:?}", events[0]);
+    let page = &rendered.records_after(0, Some("page"), 10).unwrap()[0];
+    assert_eq!(page.data["text"], "Grant Deadline 1 Dec 2026");
+    // The browser identified itself as rayap and respected the host queue (robots first).
+    let agents = site.user_agents();
+    assert!(agents.iter().all(|ua| ua.contains("rayap/")), "{agents:?}");
+    assert_eq!(site.requests()[0], "/robots.txt");
+}

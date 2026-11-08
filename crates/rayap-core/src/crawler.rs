@@ -185,8 +185,8 @@ struct Crawler<'a> {
     /// Crawl-delay per host, per origin; a host uses the largest among its origins.
     origin_delays: HashMap<String, HashMap<String, Duration>>,
     seed_hosts: &'a HashMap<String, String>,
-    /// How each source's pages are read, by source name.
-    extractors: &'a HashMap<String, Extractor>,
+    /// How each source's pages are read, by source name, and whether they are rendered.
+    extractors: &'a HashMap<String, (Extractor, bool)>,
     in_flight: usize,
     stats: Stats,
     /// Events of the batch being recorded, delivered once it is committed.
@@ -249,7 +249,7 @@ pub async fn crawl<F: FnMut(&Event)>(
     let start = store.begin_run(&sources, options.plan.as_ref())?;
     let (run, resumed) = (start.run, start.resumed);
     let mut seed_hosts = HashMap::new();
-    let mut extractors = HashMap::new();
+    let mut extractors: HashMap<String, (Extractor, bool)> = HashMap::new();
     for source in &config.sources {
         let url = urlnorm::normalize(&source.url, None).expect("validated in Config");
         seed_hosts.insert(source.name.clone(), urlnorm::host(&url));
@@ -265,7 +265,7 @@ pub async fn crawl<F: FnMut(&Event)>(
                 product_token: config.crawler.product_token.clone(),
             },
         };
-        extractors.insert(source.name.clone(), extractor);
+        extractors.insert(source.name.clone(), (extractor, source.render));
         let seed = NewPage {
             url: url.to_string(),
             source: source.name.clone(),
@@ -428,7 +428,7 @@ struct ShardSetup {
     writer: Writer,
     run: i64,
     seed_hosts: Arc<HashMap<String, String>>,
-    extractors: Arc<HashMap<String, Extractor>>,
+    extractors: Arc<HashMap<String, (Extractor, bool)>>,
     clients: Arc<Clients>,
     holds: Vec<(String, Duration)>,
     robots_failures: Vec<(String, u32)>,
@@ -587,10 +587,12 @@ async fn run_shard(setup: ShardSetup) -> Result<ShardOutcome> {
                             }
                             Job::Page(page) => {
                                 let url = Url::parse(&page.url).expect("stored URLs are valid");
-                                let extractor =
+                                let (extractor, rendered) =
                                     extractor.expect("every page belongs to a configured source");
-                                let result =
-                                    fetch::fetch_page(&clients, &url, max_body, &extractor).await;
+                                let result = fetch::fetch_page(
+                                    &clients, &url, max_body, &extractor, rendered,
+                                )
+                                .await;
                                 Done::Page { host, page, result }
                             }
                         };

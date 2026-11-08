@@ -38,7 +38,7 @@ url = "https://futo.org/grants/"
 
 [[source]]
 name = "alpha-omega"
-url = "https://alpha-omega.dev/grants/"
+url = "https://alpha-omega.dev/grants/"   # main region is empty even in headless Chrome (8 Nov 2026); reported as error
 
 [[source]]
 name = "floss-fund"

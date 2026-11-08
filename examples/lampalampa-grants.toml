@@ -24,6 +24,7 @@ url = "https://www.terravivagrants.org/national-geographic-society-the-human-thr
 [[source]]
 name = "newsfuel-739"
 url = "https://newsfuel.org/opportunities/739"
+render = true   # a React shell over plain HTTP; the opportunity text is drawn by script
 
 [[source]]
 name = "andpurpose-human-thread"

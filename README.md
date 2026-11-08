@@ -158,6 +158,22 @@ every LinkedIn URL before any page request, which is the correct behaviour. The 
 exist are their crawl whitelist, the official APIs for a page you own, or a page you control
 where people post the links.
 
+### JavaScript pages
+
+`render = true` on a source fetches its pages with a headless Chromium or Chrome found on
+`PATH` (or `RAYAP_BROWSER`), lets the page's scripts run for a bounded virtual time, and
+digests the resulting DOM with the same extractor and validator as an HTTP body. The
+request still waits its turn in the host's queue, passes robots.txt, and carries rayap's
+user agent. newsfuel.org's opportunity pages, a 55-character shell over HTTP, come back as
+900 characters of text with the deadline in them.
+
+What it does not do: solve captchas, spoof fingerprints, rotate identities or reuse
+logins. A challenge page rendered in a browser is still a challenge page. And a site whose
+main region is empty even in a browser (alpha-omega.dev/grants on 8 Nov 2026) is still an
+`error`. The browser's own subresource requests are not scheduled by rayap, so this route
+is for the handful of sources that need it, not for broad crawls. Without a browser
+installed, rendered sources report an error instead of silently falling back to HTTP.
+
 ### Structured sources: companies
 
 `kind = "company"` reads an organisation's public website: the homepage becomes one
