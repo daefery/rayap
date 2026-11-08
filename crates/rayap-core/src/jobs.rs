@@ -362,7 +362,7 @@ fn eligibility(location: &str, timezones: &[f64], country: &Country) -> Eligibil
         if needle.contains(' ') || needle.contains('-') {
             loc.contains(needle)
         } else {
-            words.iter().any(|w| *w == needle)
+            words.contains(&needle)
         }
     };
     let name = country.name.to_ascii_lowercase();
@@ -477,24 +477,21 @@ mod tests {
             ),
             (false, "excluded")
         );
-        assert_eq!(e("USA, Canada, USA timezones", &[]).eligible, false);
-        assert_eq!(
+        assert!(!e("USA, Canada, USA timezones", &[]).eligible);
+        assert!(
             e("Worldwide except Indonesia", &[]).eligible,
-            true,
             "named wins over the except clause: the board named the country"
         );
-        assert_eq!(
-            e("Worldwide except Russia", &[]).eligible,
-            false,
+        assert!(
+            !e("Worldwide except Russia", &[]).eligible,
             "an except clause disables the worldwide rule"
         );
-        assert_eq!(
-            e("Malaysia", &[]).eligible,
-            false,
+        assert!(
+            !e("Malaysia", &[]).eligible,
             "a neighbour is not the country"
         );
         // "sea" alias must not match inside other words.
-        assert_eq!(e("Seattle", &[]).eligible, false);
+        assert!(!e("Seattle", &[]).eligible);
     }
 
     #[test]
