@@ -382,20 +382,20 @@ mod tests {
     use super::*;
 
     const HOME: &str = r#"<!doctype html><html><head>
-        <title>Exa</title>
-        <meta name="description" content="Search API for AI agents that need real-time web data">
-        <meta property="og:site_name" content="Exa">
+        <title>Acme Search</title>
+        <meta name="description" content="A search API for applications that need web data">
+        <meta property="og:site_name" content="Acme Search">
         <meta property="og:type" content="website">
-        <script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Exa","legalName":"Exa Labs, Inc.","url":"https://exa.ai","logo":"https://exa.ai/logo.png"}</script>
+        <script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Acme Search","legalName":"Acme Search, Inc.","url":"https://acme-search.example","logo":"https://acme-search.example/logo.png"}</script>
         </head><body>
-        <header><nav><a href="/about">About</a><a href="/careers">Careers</a><a href="/blog/exa-3">Blog</a><a href="/contact/sales">Sales</a></nav></header>
+        <header><nav><a href="/about">About</a><a href="/careers">Careers</a><a href="/blog/release-3">Blog</a><a href="/contact/sales">Sales</a></nav></header>
         <main><h1>Web search for AI</h1><p>Realtime data from the web for your AI.</p></main>
-        <footer><a href="https://www.linkedin.com/company/exa-ai/">LinkedIn</a><a href="https://x.com/exaailabs">X</a>
-        <a href="https://x.com/intent/tweet?text=hi">share</a><a href="https://github.com/exa-labs">GitHub</a></footer>
+        <footer><a href="https://www.linkedin.com/company/acme-search/">LinkedIn</a><a href="https://x.com/acmesearch">X</a>
+        <a href="https://x.com/intent/tweet?text=hi">share</a><a href="https://github.com/acme-search">GitHub</a></footer>
         </body></html>"#;
 
     fn home() -> Url {
-        Url::parse("https://exa.ai/").unwrap()
+        Url::parse("https://acme-search.example/").unwrap()
     }
 
     #[test]
@@ -403,24 +403,33 @@ mod tests {
         let out = extract(&home(), &home(), HOME.as_bytes(), "rayap");
         assert_eq!(out.records.len(), 1);
         let r = &out.records[0];
-        assert_eq!((r.kind.as_str(), r.key.as_str()), ("company", "exa.ai"));
-        assert_eq!(r.data["name"], "Exa");
-        assert_eq!(r.data["legal_name"], "Exa Labs, Inc.");
+        assert_eq!(
+            (r.kind.as_str(), r.key.as_str()),
+            ("company", "acme-search.example")
+        );
+        assert_eq!(r.data["name"], "Acme Search");
+        assert_eq!(r.data["legal_name"], "Acme Search, Inc.");
         assert_eq!(r.data["kind"], "Organization");
-        assert_eq!(r.data["logo"], "https://exa.ai/logo.png");
+        assert_eq!(r.data["logo"], "https://acme-search.example/logo.png");
         assert_eq!(
             r.data["description"],
-            "Search API for AI agents that need real-time web data"
+            "A search API for applications that need web data"
         );
         assert_eq!(
             r.data["text"],
             "Web search for AI Realtime data from the web for your AI."
         );
-        assert_eq!(r.data["pages"]["about"], "https://exa.ai/about");
-        assert_eq!(r.data["pages"]["careers"], "https://exa.ai/careers");
+        assert_eq!(
+            r.data["pages"]["about"],
+            "https://acme-search.example/about"
+        );
+        assert_eq!(
+            r.data["pages"]["careers"],
+            "https://acme-search.example/careers"
+        );
         assert!(
             r.data["pages"].get("blog").is_none(),
-            "/blog/exa-3 is a post, not the blog index"
+            "/blog/release-3 is a post, not the blog index"
         );
         assert!(
             r.data["pages"].get("contact").is_none(),
@@ -428,29 +437,35 @@ mod tests {
         );
         assert_eq!(
             r.data["social"]["linkedin"],
-            "https://www.linkedin.com/company/exa-ai/"
+            "https://www.linkedin.com/company/acme-search/"
         );
         assert_eq!(
-            r.data["social"]["x"], "https://x.com/exaailabs",
+            r.data["social"]["x"], "https://x.com/acmesearch",
             "the share intent is skipped"
         );
-        assert_eq!(r.data["social"]["github"], "https://github.com/exa-labs");
+        assert_eq!(r.data["social"]["github"], "https://github.com/acme-search");
         let next: Vec<&str> = out.next.iter().map(Url::as_str).collect();
-        assert_eq!(next, ["https://exa.ai/about", "https://exa.ai/careers"]);
+        assert_eq!(
+            next,
+            [
+                "https://acme-search.example/about",
+                "https://acme-search.example/careers"
+            ]
+        );
     }
 
     #[test]
     fn well_known_page_yields_a_company_page_record() {
-        let careers = Url::parse("https://exa.ai/careers").unwrap();
+        let careers = Url::parse("https://acme-search.example/careers").unwrap();
         let body = "<html><body><nav>menu</nav><main><h1>Careers</h1><p>Software Engineer, Web Crawling. Zurich.</p></main></body></html>";
         let out = extract(&careers, &home(), body.as_bytes(), "rayap");
         let r = &out.records[0];
         assert_eq!(
             (r.kind.as_str(), r.key.as_str()),
-            ("company_page", "https://exa.ai/careers")
+            ("company_page", "https://acme-search.example/careers")
         );
         assert_eq!(r.data["role"], "careers");
-        assert_eq!(r.data["company"], "exa.ai");
+        assert_eq!(r.data["company"], "acme-search.example");
         assert_eq!(
             r.data["text"],
             "Careers Software Engineer, Web Crawling. Zurich."

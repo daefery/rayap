@@ -77,8 +77,9 @@ pub struct Source {
     /// For `kind = "tiktok"`: comments to collect per post (rounded up to whole API pages).
     #[serde(default = "default_max_comments")]
     pub max_comments: u32,
-    /// For `kind = "jobs"`: the country applicants live in; each job is marked eligible or
-    /// not for it. Default Indonesia.
+    /// For `kind = "jobs"` / `"ats"` / `"company"`: the country to evaluate each posting's
+    /// stated hiring rule against (`eligible_from`). Default Indonesia, which has the fullest
+    /// alias and timezone table; any country name works with explicit mentions only.
     #[serde(default = "default_country")]
     pub country: String,
     /// For `kind = "jobs"`: listings to collect from a paged feed.

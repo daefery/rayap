@@ -88,7 +88,7 @@ embedded data says *deleted* is `gone`; a 44,103-byte page with an empty title a
 bot-check script is a *challenge*, which holds the host for five minutes and retries, like
 a 429 the server forgot to send. That last one appeared on 6 to 9 of 118 requests after
 ~470 requests to one host in two hours; the validator refused every one and nothing wrong
-was stored ([`bench/tiktok/revisit/`](../bench/tiktok/revisit/README.md)). For pages that
+was stored ([`bench/tiktok/`](../bench/tiktok/README.md), aggregates only). For pages that
 genuinely need JavaScript, there is now a browser route through the same queue and robots
 check; it does not solve captchas or spoof anything, and a site that stays empty in a
 browser stays an `error`.
@@ -118,7 +118,7 @@ It is an engine with a measured politeness proof, a measured revisit planner, a 
 that has refused real challenge pages, sharded coordinators, structured sources (page text,
 TikTok posts and comments, company sites), Web Bot Auth request signing that reproduces the
 IETF draft's test vector byte for byte, and a read-only dashboard over the same SQLite
-file. 141 tests; the end-to-end suite runs at 1 and N shards.
+file. 151 tests; the end-to-end suite runs at 1 and N shards.
 
 It is not an index, not a search engine, not distributed across machines, and not a way
 around anything a site has decided to block. The next ceilings are named with numbers in

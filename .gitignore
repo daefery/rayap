@@ -3,3 +3,11 @@
 *.db-wal
 *.db-shm
 council/
+.lavish/
+# Crawl output is never committed: it is other people's content and may contain personal
+# data. Keep it local (the examples write to ~/rayap/ or wherever --db points).
+*.jsonl
+bench/*/*.stderr
+bench/tiktok/revisit*/
+bench/grants/*.jsonl
+refused/

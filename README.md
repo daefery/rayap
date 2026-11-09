@@ -9,7 +9,7 @@ crawl resumes where it stopped, and the next run reports only what changed. One 
 no services; a read-only dashboard and JSON API over the same file.
 
 > Status: early. Built in one week (6–8 Nov 2026) as a portfolio piece for web-crawling
-> infrastructure work. The engine and CLI are tested (141 tests); the numbers below are
+> infrastructure work. The engine and CLI are tested (151 tests); the numbers below are
 > measured and every one links to its raw file and command.
 
 ## Measured
@@ -21,8 +21,8 @@ no services; a read-only dashboard and JSON API over the same file.
 | Batched commits (one transaction per drained batch) | **1.46x** steady throughput, 3 alternating pairs | [table](bench/README.md#a-second-optimisation-batched-commits-7-nov-2026) |
 | Sharded coordinators (`--shards N`, one store writer) | **1.79x** at 8 shards on 10k hosts; the 20k-host cliff is gone (1.45x at 4 shards) | [table](bench/README.md#sharded-coordinators-8-nov-2026) |
 | Revisit planner vs uniform polling, hidden change rates, oracle ceiling | **1.2–1.85x** changes caught per fetch; closes ~2/3 of the gap to the oracle; mean staleness 75 h → 28.5 h | [table](bench/README.md#revisit-scheduling-learned-change-rates-vs-uniform-polling-7-nov-2026) |
-| Real sites: 118 TikTok posts, 3 revisits | 115 posts + 4,465 comments; **98 of 205 "changed" comment pages were the same comments reordered** (fixed: set fingerprint); TikTok's 44 KB captcha page refused by the validator and backed off from | [bench/tiktok](bench/tiktok/README.md), [revisit](bench/tiktok/revisit/README.md) |
-| Real sites: 23 grant funders, 6 companies | 21 pages with readable text (two were JavaScript shells, reported as such); 5 `company` + 15 `company_page` records in 22 requests | [bench/grants](bench/grants/README.md), [examples/](examples/) |
+| Real sites: 118 TikTok posts, 3 revisits | 115 posts + 4,072 comments (aggregates only; raw captures are not published); **98 of 205 "changed" comment pages were the same comments reordered** (fixed: set fingerprint); TikTok's 44 KB captcha page refused by the validator and backed off from | [bench/tiktok](bench/tiktok/README.md) |
+| Real sites: 23 grant funders, 5 companies | 21 pages with readable text (two were JavaScript shells, reported as such); `company` and `company_page` records from the funders' and companies' own sites | [bench/grants](bench/grants/README.md), [examples/](examples/) |
 
 100 million pages a day is 1,157 pages/s. The throughput numbers are a loopback
 simulation, not the public internet; [bench/README.md](bench/README.md) lists what the
@@ -165,33 +165,32 @@ main region is empty even in a browser (alpha-omega.dev/grants on 8 Nov 2026) is
 is for the handful of sources that need it, not for broad crawls. Without a browser
 installed, rendered sources report an error instead of silently falling back to HTTP.
 
-### Remote jobs you can apply for from Indonesia
+### Employer job boards (Greenhouse, Lever, Ashby)
 
-`kind = "jobs"` reads remote-job boards that publish public JSON feeds for redistribution
-(Himalayas, cursor-paged; Remote OK, one page) into `job` records: title, company, the
-board's own location text verbatim, allowed timezones, type, seniority, salary, posted
-time, an excerpt, the listing URL and the attribution each board asks for. Every job is
-marked `eligible_from` the configured country by a stated rule: the board names the
-country, says Worldwide/Anywhere/Global or the country's region, or sets no country and no
-excluding timezone window; anything else is `false`, with the reason. Remotive's feed is
+`kind = "ats"` reads an employer's own job board through the public API its
+applicant-tracking system publishes (Greenhouse, Lever, Ashby) into `job` records: title,
+department, the posting's location text verbatim, employment type, salary where the board
+states it, posted time, an excerpt, and the employer's own posting URL. A `company` source
+finds that board without being told: the careers page links `job-boards.greenhouse.io/<slug>`,
+`jobs.lever.co/<slug>`, `jobs.ashbyhq.com/<slug>` or a `grnh.se` short link whose redirect
+names it, and rayap hands over to the board's API. A listing on an aggregator is a copy;
+the employer's board is the original, and revisits report new and removed postings there.
+
+`kind = "jobs"` reads aggregator feeds published for redistribution (Himalayas, Remote OK)
+into the same record shape, with the attribution each board asks for. Remotive's feed is
 supported but its robots.txt disallows `/api/*`, so rayap blocks it.
 
-**Aggregators are copies; the employer's own board is the original.** `kind = "ats"`
-reads an employer's board through its applicant-tracking system's public API (Greenhouse,
-Lever, Ashby), and a `company` source finds that board on its own: the careers page links
-`job-boards.greenhouse.io/<slug>`, `jobs.lever.co/<slug>`, `jobs.ashbyhq.com/<slug>` or a
-`grnh.se` short link whose redirect names it, and rayap hands over to the board's API.
-Where a posting's text lists the countries it hires in ("Countries: Brazil, Canada, …,
-Indonesia, …"), that list decides and is kept on the record as `hiring_sentence`; a vague
-location field ("Remote") does not override it in either direction.
+Where a posting's text states where it hires ("Countries: …", "we can hire in …", "must be
+based in …"), that passage is kept on the record as `hiring_sentence`, and `eligible_from`
+applies a stated rule for a configured country against it (falling back to the location
+field): the record always says which rule fired, so the verdict can be read and disagreed
+with. A vendor's not-remote flag excludes outright. The rule is a dozen lines in
+`jobs.rs` with a test per case; it is a reading aid, not a promise about an employer.
 
-8 Nov 2026: `examples/remote-jobs.toml` (aggregators) gave 494 jobs, 68 eligible from
-Indonesia, of which 47 are only "no restriction stated". `examples/companies.toml` reached
-three employers' own boards without being told where they were (Exa and Firecrawl on
-Ashby, Wikimedia on Greenhouse via short links): 106 original postings, **16 eligible, 14
-of them because Wikimedia's postings name Indonesia in their hiring list**, 59 excluded
-because the employer marks them on-site. The dashboard shows the sentence each verdict
-came from; `/api/companies/records?kind=job&eligible=1` answers it as JSON.
+8 Nov 2026, `examples/companies.toml`: two employers' boards reached from their own sites
+without configuration (one on Ashby, one on Greenhouse via short links); the Greenhouse
+postings each carried a hiring-countries list, and 59 of the Ashby postings were marked
+on-site by the vendor. Crawl output stays local; counts only are published here.
 
 ### Structured sources: companies
 
@@ -246,9 +245,9 @@ A verification page served instead of a post (HTTP 200, no data) holds the host 
 minutes and the page is retried; nothing is stored.
 
 Measured 7 Nov 2026: 118 public posts, 2 s between requests, no login or cookies. First
-visit and revisits in [bench/tiktok](bench/tiktok/README.md) and
-[bench/tiktok/revisit](bench/tiktok/revisit/README.md): a visit-everything revisit costs
-368 requests and 67 MB, 77% of it post pages; a `--budget 30` revisit 30 requests and 13 MB.
+visit and revisits, as aggregates, in [bench/tiktok](bench/tiktok/README.md): a
+visit-everything revisit costs 368 requests and 67 MB, 77% of it post pages; a
+`--budget 30` revisit 30 requests and 13 MB.
 New comments found per byte is not measured yet (no comments arrived in the windows tried).
 TikTok's robots.txt allows `/@handle/video/` for rayap's user agent; its terms of service
 forbid automated collection, so keep volume low and use it only where you have the right to.
@@ -284,7 +283,7 @@ forbid automated collection, so keep volume low and use it only where you have t
 2. Cheaper writes and, when needed, one database per shard: with `--shards` in, the single
    store writer is what caps throughput (see "What breaks first" in the benchmark).
 3. Conditional requests (`If-None-Match`, `If-Modified-Since`). Deferred: of the 7 real
-   sources in `examples/` and `bench/tiktok`, checked 7 Nov 2026, only one
+   sources in `examples/`, checked 7 Nov 2026, only one
    (andpurpose.world) sends a validator and answers 304; the rest send neither `ETag` nor
    `Last-Modified`, so conditional requests would save nothing there.
 4. Signed-directory response (the optional signature over the JWK Set itself, for

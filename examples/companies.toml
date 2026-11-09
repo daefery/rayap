@@ -7,11 +7,6 @@ contact = "https://github.com/daefery/rayap"
 per_host_delay_ms = 3000
 
 [[source]]
-name = "exa"
-url = "https://exa.ai/"
-kind = "company"
-
-[[source]]
 name = "sovereign-tech"
 url = "https://www.sovereign.tech/"
 kind = "company"

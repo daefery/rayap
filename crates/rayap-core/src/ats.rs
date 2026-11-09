@@ -332,8 +332,8 @@ mod tests {
             Some((Vendor::Lever, "toptal".into()))
         );
         assert_eq!(
-            classify(&Url::parse("https://api.ashbyhq.com/posting-api/job-board/exa").unwrap()),
-            Some((Vendor::Ashby, "exa".into()))
+            classify(&Url::parse("https://api.ashbyhq.com/posting-api/job-board/acme").unwrap()),
+            Some((Vendor::Ashby, "acme".into()))
         );
         assert_eq!(
             classify(&Url::parse("https://example.org/jobs").unwrap()),
@@ -341,9 +341,9 @@ mod tests {
         );
         let links = [
             Url::parse("https://example.org/about").unwrap(),
-            Url::parse("https://jobs.ashbyhq.com/exa").unwrap(),
+            Url::parse("https://jobs.ashbyhq.com/acme").unwrap(),
         ];
-        assert_eq!(discover(&links), Some((Vendor::Ashby, "exa".into())));
+        assert_eq!(discover(&links), Some((Vendor::Ashby, "acme".into())));
         let gh = [Url::parse("https://boards.greenhouse.io/embed/job_board?for=stripe").unwrap()];
         assert_eq!(discover(&gh), Some((Vendor::Greenhouse, "stripe".into())));
         assert_eq!(
@@ -386,12 +386,12 @@ mod tests {
         assert_eq!(r.data["posted_at"], 1789027672);
 
         let ashby = serde_json::json!({"jobs":[
-            {"id":"x1","title":"Solutions Architect","location":"San Francisco","secondaryLocations":[],"isRemote":true,"workplaceType":"Remote","employmentType":"FullTime","department":"GTM","compensation":{"compensationTierSummary":"$160K – $300K"},"publishedAt":"2026-11-06T00:17:51.024+00:00","jobUrl":"https://jobs.ashbyhq.com/exa/x1","isListed":true},
-            {"id":"x2","title":"Recruiter","location":"San Francisco","isRemote":false,"workplaceType":"OnSite","jobUrl":"https://jobs.ashbyhq.com/exa/x2","isListed":true},
-            {"id":"x3","title":"Hidden","location":"","jobUrl":"https://jobs.ashbyhq.com/exa/x3","isListed":false}
+            {"id":"x1","title":"Solutions Architect","location":"San Francisco","secondaryLocations":[],"isRemote":true,"workplaceType":"Remote","employmentType":"FullTime","department":"GTM","compensation":{"compensationTierSummary":"$160K – $300K"},"publishedAt":"2026-11-06T00:17:51.024+00:00","jobUrl":"https://jobs.ashbyhq.com/acme/x1","isListed":true},
+            {"id":"x2","title":"Recruiter","location":"San Francisco","isRemote":false,"workplaceType":"OnSite","jobUrl":"https://jobs.ashbyhq.com/acme/x2","isListed":true},
+            {"id":"x3","title":"Hidden","location":"","jobUrl":"https://jobs.ashbyhq.com/acme/x3","isListed":false}
         ]}).to_string();
         let out = extract(
-            &Url::parse("https://api.ashbyhq.com/posting-api/job-board/exa").unwrap(),
+            &Url::parse("https://api.ashbyhq.com/posting-api/job-board/acme").unwrap(),
             ashby.as_bytes(),
             &idn(),
         )
@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(out.records[0].data["salary"], "$160K – $300K");
         assert_eq!(
             out.records[0].data["eligible_from"]["eligible"], false,
-            "remote but located in SF: the text names a place that is not Indonesia"
+            "remote but located in SF: the text names a place that is not the configured country"
         );
         assert_eq!(out.records[1].data["eligible_from"]["reason"], "on-site");
     }

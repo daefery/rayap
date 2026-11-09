@@ -1,8 +1,7 @@
-# Remote jobs from boards that publish public JSON feeds for redistribution (each asks for
-# attribution and a link back to the listing; both are in every record). Every job is marked
-# `eligible_from.eligible` for applicants living in `country`, by a stated rule: the board
-# names the country, says Worldwide/Anywhere/Global or the country's region, or sets no
-# country and no excluding timezone window. The board's own location text is kept verbatim.
+# Remote-job aggregator feeds published for redistribution (each asks for attribution and a
+# link back to the listing; both are in every record). Each job is marked `eligible_from`
+# a configured country by a stated rule against the board's own location text and the
+# posting body; the record says which rule fired. Crawl output stays local.
 
 [crawler]
 contact = "https://github.com/daefery/rayap"
