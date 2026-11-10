@@ -13,10 +13,11 @@ What it does: crawl a list of sources, one request at a time per host with robot
 checked first, keep all state in SQLite so a crash resumes instead of restarting, and write
 one JSON event per page (`new`, `changed`, `unchanged`, `rebaseline`, `redirect`, `gone`,
 `blocked`, `error`) with the page's main text stored so a change can be read, not only
-noticed. Public pages only: no logins, no CAPTCHA solving, no fingerprint spoofing, and a
-site that blocks the crawler stays blocked.
+noticed. Public pages only: no logins, no CAPTCHA solving, no fingerprint spoofing.
+Robots rules are respected by default; an [explicit per-origin override](docs/sources.md#explicit-robots-overrides)
+can permit a disallowed request, but does not bypass server-side access controls.
 
-> Status: early. One developer, built 6–8 Nov 2026. 151 tests; the end-to-end suite runs
+> Status: early. One developer, first built 6–8 Nov 2026. The end-to-end suite runs
 > at 1 and N shards. [docs/write-up.md](docs/write-up.md) tells the three findings behind
 > the numbers in 1,400 words and is the best place to start reading.
 
@@ -79,7 +80,8 @@ flowchart LR
   most 24 h, first 500 KiB parsed. `rayap` groups win over `*`; longest match wins, allow
   wins ties; `*` and `$`; percent-encoding normalised. A 4xx allows everything; a 429, 5xx
   or network failure keeps the origin's pages waiting with backoff, and only after
-  `max_attempts` failures are they reported `blocked`. Redirect hops (up to 5) are scheduled
+  `max_attempts` failures are they reported `blocked`. An explicit origin override can
+  ignore a known `Disallow`, not a fetch failure or host delay. Redirect hops (up to 5) are scheduled
   like any other request. `Crawl-delay` is honoured per origin, capped by `max_crawl_delay_ms`.
 - **Backs off when asked.** `429` and `503` hold the whole host for the full `Retry-After`;
   other failures retry with growing backoff up to `max_attempts`. Every wait is stored, so a
@@ -106,7 +108,9 @@ flowchart LR
   visit" observations), plus every page never fetched. Continuation pages (the next page of
   a list) are fetched only when their parent changed or its activity count moved.
 - **JavaScript pages** can be fetched through a headless Chromium (`render = true`), through
-  the same queue, robots check and validator; no sessions, no evasion.
+  the same initial-navigation queue, robots policy and validator; no sessions, no evasion.
+  Browser redirects and subrequests are outside that scheduler; see the
+  [browser limitations](docs/sources.md#javascript-pages).
 
 ## Quickstart
 
@@ -177,7 +181,7 @@ writes, acknowledge a batch before fsync, one database per shard.
 | `crates/rayap-core/src/tiktok.rs`, `company.rs`, `jobs.rs`, `ats.rs` | structured sources |
 | `crates/rayap-core/src/render.rs` | headless Chrome route for JavaScript pages |
 | `crates/rayap-core/src/signing.rs` | Web Bot Auth request signing (RFC 9421, Ed25519) |
-| `crates/rayap-core/tests/crawl.rs` | 30 end-to-end tests against a local server, run at 1 and N shards |
+| `crates/rayap-core/tests/crawl.rs` | end-to-end tests against a local server, run at 1 and N shards |
 | `crates/rayap-cli` | the `rayap` command: `crawl`, `events`, `records`, `rates`, `serve`, `key`, `check` |
 | `crates/rayap-serve` | read-only JSON API and the one-file dashboard |
 | `crates/rayap-sim` | simulated web plus the independent politeness referee |

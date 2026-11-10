@@ -258,6 +258,128 @@ async fn crawls_follows_links_and_respects_robots() {
 }
 
 #[tokio::test]
+async fn robots_override_requires_opt_in_and_keeps_crawl_delay() {
+    let site = Site::default();
+    site.set(
+        "/robots.txt",
+        Reply::Text("User-agent: *\nDisallow: /\nCrawl-delay: 1\n".into()),
+    );
+    site.set(
+        "/",
+        Reply::Html("<p>Public page</p><a href='/next'>next</a>".into()),
+    );
+    site.set("/next", Reply::Html("<p>Next page</p>".into()));
+    let addr = start(site.clone()).await;
+    let mut cfg = config(addr, 30, 1);
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(kinds(&events), [("/".into(), EventKind::Blocked)]);
+    assert_eq!(site.requests(), ["/robots.txt"]);
+
+    site.log.lock().unwrap().clear();
+    cfg.crawler.robots_override_origins = vec![format!("http://{addr}")];
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(
+        kinds(&events),
+        [
+            ("/".into(), EventKind::New),
+            ("/next".into(), EventKind::New)
+        ]
+    );
+    assert_eq!(site.requests(), ["/robots.txt", "/", "/next"]);
+    for pair in site.times().windows(2) {
+        assert!(pair[1] - pair[0] >= std::time::Duration::from_secs(1));
+    }
+    assert!(site.user_agents().iter().all(|ua| ua.contains("rayap/")));
+}
+
+#[tokio::test]
+async fn robots_override_does_not_follow_redirects_to_unlisted_origins() {
+    let target = Site::default();
+    target.set(
+        "/robots.txt",
+        Reply::Text("User-agent: *\nDisallow: /\n".into()),
+    );
+    target.set("/private", Reply::Html("<p>Must not fetch</p>".into()));
+    let target_addr = start(target.clone()).await;
+    let site = Site::default();
+    site.set(
+        "/robots.txt",
+        Reply::Text("User-agent: *\nDisallow: /\n".into()),
+    );
+    site.set(
+        "/",
+        Reply::Redirect(format!("http://{target_addr}/private")),
+    );
+    let addr = start(site.clone()).await;
+    let mut cfg = config(addr, 0, 0);
+    cfg.crawler.robots_override_origins = vec![format!("http://{addr}")];
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(
+        kinds(&events),
+        [
+            ("/".into(), EventKind::Redirect),
+            ("/private".into(), EventKind::Blocked)
+        ]
+    );
+    assert_eq!(site.requests(), ["/robots.txt", "/"]);
+    assert_eq!(
+        target.requests(),
+        ["/robots.txt"],
+        "a different port is a different origin"
+    );
+}
+
+#[tokio::test]
+async fn robots_override_keeps_http_denials_and_retry_after() {
+    let site = Site::default();
+    site.set(
+        "/robots.txt",
+        Reply::Text("User-agent: *\nDisallow: /\n".into()),
+    );
+    site.set("/", Reply::Status(403));
+    let addr = start(site.clone()).await;
+    let mut cfg = config(addr, 0, 0);
+    cfg.crawler.robots_override_origins = vec![format!("http://{addr}")];
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(kinds(&events), [("/".into(), EventKind::Error)]);
+    assert_eq!(events[0].status, Some(403));
+
+    site.log.lock().unwrap().clear();
+    site.set(
+        "/",
+        Reply::TooManyRequests {
+            retry_after: "1",
+            times: 1,
+        },
+    );
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(kinds(&events), [("/".into(), EventKind::New)]);
+    assert_eq!(site.requests(), ["/robots.txt", "/", "/"]);
+    let times = site.times();
+    assert!(times[2] - times[1] >= std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn robots_override_does_not_override_unreachable_robots() {
+    let site = Site::default();
+    site.set("/robots.txt", Reply::Status(503));
+    site.set("/", Reply::Html("<p>Must not fetch</p>".into()));
+    let addr = start(site.clone()).await;
+    let mut cfg = config(addr, 0, 0);
+    cfg.crawler.robots_override_origins = vec![format!("http://{addr}")];
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg, &mut store, Options::default()).await;
+    assert_eq!(kinds(&events), [("/".into(), EventKind::Blocked)]);
+    assert_eq!(
+        site.requests(),
+        ["/robots.txt", "/robots.txt", "/robots.txt"]
+    );
+}
+
+#[tokio::test]
 async fn second_run_reports_only_real_changes() {
     let site = Site::default();
     site.set(
@@ -1484,6 +1606,25 @@ async fn a_rendered_source_runs_the_pages_javascript_first() {
     let agents = site.user_agents();
     assert!(agents.iter().all(|ua| ua.contains("rayap/")), "{agents:?}");
     assert_eq!(site.requests()[0], "/robots.txt");
+
+    // The same gate applies before the browser launches. Only the explicit override
+    // lets the rendered source proceed when robots disallows its navigation.
+    site.set(
+        "/robots.txt",
+        Reply::Text("User-agent: *\nDisallow: /\n".into()),
+    );
+    site.log.lock().unwrap().clear();
+    let mut blocked = Store::open_in_memory().unwrap();
+    let (_, events) = run(&cfg(true), &mut blocked, Options::default()).await;
+    assert_eq!(events[0].kind, EventKind::Blocked);
+    assert_eq!(site.requests(), ["/robots.txt"]);
+
+    let mut override_cfg = cfg(true);
+    override_cfg.crawler.robots_override_origins = vec![format!("http://{addr}")];
+    let (_, events) = run(&override_cfg, &mut blocked, Options::default()).await;
+    assert_eq!(events[0].kind, EventKind::New);
+    let page = &blocked.records_after(0, Some("page"), 10).unwrap()[0];
+    assert_eq!(page.data["text"], "Grant Deadline 1 Dec 2026");
 }
 
 #[tokio::test]

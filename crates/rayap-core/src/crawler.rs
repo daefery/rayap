@@ -785,8 +785,19 @@ impl Crawler<'_> {
 
         match state {
             Some(RobotsState::Known { rules, .. })
-                if rules.allowed(&url[url::Position::BeforePath..]) =>
+                if rules.allowed(&url[url::Position::BeforePath..])
+                    || self
+                        .config
+                        .crawler
+                        .robots_override_origins
+                        .contains(&origin) =>
             {
+                if !rules.allowed(&url[url::Position::BeforePath..]) {
+                    eprintln!(
+                        "rayap: warning: overriding robots.txt Disallow for {} (explicit origin override: {origin})",
+                        page.url
+                    );
+                }
                 Ok(Step::Start {
                     host,
                     job: Job::Page(page),

@@ -40,6 +40,13 @@
   .rec .meta { color:var(--muted); font-size:12px; margin-top:2px; }
   .rec .excerpt { color:#333; margin-top:2px; }
   .rec details { margin-top:4px; } .rec summary { cursor:pointer; } .rec .full { margin-top:6px; max-height:400px; overflow:auto; border-left:2px solid var(--line); padding-left:8px; }
+  .social-stats { display:flex; flex-wrap:wrap; gap:12px 24px; margin:10px 0; }
+  .social-stats dt { color:var(--muted); font-size:12px; }
+  .social-stats dd { margin:0; font-weight:600; font-size:16px; }
+  .capture-note { color:var(--warn); margin:8px 0; }
+  .comments { margin:8px 0; padding-left:24px; max-height:420px; overflow:auto; }
+  .comments li { padding:8px 4px; border-top:1px solid var(--line); }
+  .rec .t { overflow-wrap:anywhere; }
   .empty { color:var(--muted); padding:40px 0; text-align:center; }
   .err { color:var(--bad); }
   footer { color:var(--muted); font-size:12px; padding:12px 20px; }
@@ -165,6 +172,8 @@ function recordBody(r) {
   if (r.kind === 'page') return pageRecord(r, d);
   if (r.kind === 'job') return jobRecord(r, d);
   if (r.kind === 'company') return companyRecord(r, d);
+  if (r.kind === 'instagram_post') return instagramPost(r, d);
+  if (r.kind === 'instagram_comment') return instagramComment(d);
   const author = d.author?.handle ? `<b>@${esc(d.author.handle)}</b> ` : '';
   const text = d.text != null ? `<div class="t">${author}${esc(d.text)}</div>` : `<pre class="t">${esc(JSON.stringify(d, null, 1))}</pre>`;
   const meta = [];
@@ -175,6 +184,49 @@ function recordBody(r) {
   const link = d.url || r.url;
   meta.push(`<a href="${esc(link)}" target="_blank" rel="noopener">${esc(r.key)}</a>`);
   return text + `<div class="meta">${meta.join(' · ')}</div>`;
+}
+
+function webLink(url, label) {
+  try {
+    const parsed = new URL(url);
+    if (['http:', 'https:'].includes(parsed.protocol)) {
+      return `<a href="${esc(parsed.href)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`;
+    }
+  } catch (_) { /* Missing or invalid URLs are plain labels, never executable links. */ }
+  return esc(label);
+}
+
+function instagramComment(d) {
+  const meta = [];
+  if (d.created_at) meta.push(`posted ${fmtTime(d.created_at)}`);
+  if (d.age_label) meta.push(`${esc(d.age_label)} at capture`);
+  meta.push(`likes: ${esc(d.likes_display ?? 'unknown')}`);
+  if (d.url) meta.push(webLink(d.url, 'Original comment'));
+  if (d.post_url) meta.push(webLink(d.post_url, 'Parent post'));
+  return `<div><b>@${esc(d.username || 'unknown')}</b></div>
+    <div class="t">${esc(d.text || '')}</div>
+    <div class="meta">${meta.join(' · ')}</div>`;
+}
+
+function instagramPost(r, d) {
+  const stats = d.stats_display || {};
+  const comments = Array.isArray(d.comments) ? d.comments : [];
+  const metrics = [['Likes', stats.likes], ['Comments displayed', stats.comments], ['Shares', stats.shares]]
+    .map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value ?? 'unknown')}</dd></div>`).join('');
+  const observed = d.comments_status === 'no_comments_shown'
+    ? 'The page displayed “No comments yet.”; completeness not verified.'
+    : `${comments.length} captured comments — partial sample; completeness not verified.`;
+  const pagination = d.capture?.pagination_attempted === false ? ' Comment pagination not attempted.' : '';
+  return `<div><b>@${esc(d.username || 'unknown')}</b> <span class="k">Instagram post</span></div>
+    <div class="meta">${webLink(d.url || r.url, d.post_id || r.key)}${d.created_at ? ` · posted ${fmtTime(d.created_at)}` : ''}</div>
+    <dl class="social-stats">${metrics}</dl>
+    <div class="meta">Counts are labels observed on the page; abbreviated values are not exact totals.</div>
+    <div class="t">${esc(d.text || '')}</div>
+    <p class="capture-note">${esc(observed + pagination)}</p>
+    <details open><summary>Captured comments (${comments.length})</summary>
+      ${comments.length ? `<ol class="comments">${comments.map(c => `<li>${instagramComment(c)}</li>`).join('')}</ol>` : '<p class="meta">No comment entries in this capture.</p>'}
+    </details>
+    <div class="meta">Captured ${fmtTime(r.at)} · ${esc(d.capture?.method || 'capture method unknown')}</div>`;
 }
 
 function jobRecord(r, d) {

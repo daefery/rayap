@@ -29,6 +29,14 @@ Every HTML page's main-content text is stored as a `page` record (up to 200 KB, 
 at all (a JavaScript application shell) is an `error`, never fingerprinted; two of the real
 example sources turned out to be such shells. An `unchanged` page writes no records.
 
+## Instagram capture snapshots
+
+The dashboard can show structured post details and captured comments from locally imported
+Instagram snapshots, with separate post/comment filters and username search. Counts retain
+their displayed precision, missing values remain unknown, and incomplete comment coverage
+is labelled. This is not yet a built-in Instagram crawler; see
+[Instagram dashboard records](instagram-dashboard.md) for the data contract and limits.
+
 ## Watching grant pages
 
 `examples/ai-oss-grants.toml` lists 23 public pages of funders that give grants to AI and
@@ -47,26 +55,64 @@ visible text changed: a new call, a moved deadline, a closed programme.
 
 **LinkedIn is not a source.** Its robots.txt is `User-agent: * Disallow: /` with a notice
 that automated access needs written permission (`whitelist-crawl@linkedin.com`); search and
-feed URLs redirect to login, company post pages return 403. rayap's robots.txt gate blocks
-every LinkedIn URL before any page request, which is the correct behaviour. The routes that
+feed URLs redirect to login, company post pages return 403. Rayap's default robots.txt gate
+blocks every LinkedIn URL before any page request. The routes that
 exist are their crawl whitelist, the official APIs for a page you own, or a page you control
 where people post the links.
+
+## Explicit robots overrides
+
+Rayap respects robots.txt by default. For a deliberate exception, list exact origins in
+`[crawler]`; this is not a global "ignore all blocks" switch:
+
+```toml
+[crawler]
+contact = "https://example.org/about-our-bot"
+per_host_delay_ms = 3000
+robots_override_origins = ["https://www.example.org"]
+
+[[source]]
+name = "public-profile-test"
+url = "https://www.example.org/public-profile/"
+max_depth = 0
+# render = true  # optional browser route, described below
+```
+
+The list is empty by default. Entries contain a scheme, host and optional port, not a
+path, query, fragment, credentials or wildcard. Host case, default ports and a trailing
+slash are normalized. A different scheme, subdomain or port is a different origin.
+
+Robots.txt is still fetched first. If its rules deny a page on a listed origin, Rayap logs
+an explicit warning to stderr and schedules the page anyway. Keep stderr with the crawl's
+JSON events to retain that record. The option does not override an unreachable robots file,
+`Crawl-delay`, configured delays, host holds, retry limits, or HTTP denials. Each HTTP
+redirect destination is checked independently; the exception does not travel with it.
+Remove the list to restore default behavior on the next run. Already fetched content stays
+in the local database.
+
+This changes Rayap's local policy, not the server's permissions. A site may prohibit
+collection in its terms. It does not unlock private content, authenticate, solve CAPTCHAs,
+or create an Instagram extractor. A page record or HTTP 200 alone does not prove that
+posts or comments were retrieved; check the extracted text and fields.
 
 ## JavaScript pages
 
 `render = true` on a source fetches its pages with a headless Chromium or Chrome found on
 `PATH` (or `RAYAP_BROWSER`), lets the page's scripts run for a bounded virtual time, and
 digests the resulting DOM with the same extractor and validator as an HTTP body. The
-request still waits its turn in the host's queue, passes robots.txt, and carries rayap's
-user agent. newsfuel.org's opportunity pages, a 55-character shell over HTTP, come back as
+initial navigation still waits its turn in the host's queue, passes the configured robots
+policy (including any explicit override), and carries rayap's user agent. newsfuel.org's opportunity pages, a 55-character shell over HTTP, come back as
 900 characters of text with the deadline in them.
 
 What it does not do: solve captchas, spoof fingerprints, rotate identities or reuse
 logins. A challenge page rendered in a browser is still a challenge page. And a site whose
 main region is empty even in a browser (alpha-omega.dev/grants on 8 Nov 2026) is still an
-`error`. The browser's own subresource requests are not scheduled by rayap, so this route
-is for the handful of sources that need it, not for broad crawls. Without a browser
-installed, rendered sources report an error instead of silently falling back to HTTP.
+`error`. The browser's own redirects and subresource requests are not scheduled by Rayap
+and do not receive its per-request robots or rate checks. The DOM-only renderer also does
+not report the actual HTTP status or final URL; its event status is synthesized as 200.
+Use plain HTTP when those guarantees matter. This route is for the handful of sources
+that need it, not for broad crawls. Without a browser installed, rendered sources report
+an error instead of silently falling back to HTTP.
 
 ## Structured sources: companies
 
@@ -96,7 +142,7 @@ the employer's board is the original, and revisits report new and removed postin
 
 `kind = "jobs"` reads aggregator feeds published for redistribution (Himalayas, Remote OK)
 into the same record shape, with the attribution each board asks for. Remotive's feed is
-supported but its robots.txt disallows `/api/*`, so rayap blocks it.
+supported but its robots.txt disallows `/api/*`, so Rayap blocks it by default.
 
 Where a posting's text states where it hires ("Countries: …", "we can hire in …", "must be
 based in …"), that passage is kept on the record as `hiring_sentence`, and `eligible_from`

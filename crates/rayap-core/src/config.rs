@@ -37,6 +37,10 @@ pub struct CrawlerConfig {
     /// robots.txt product token (RFC 9309: letters, `_` and `-` only).
     #[serde(default = "default_product_token")]
     pub product_token: String,
+    /// Exact http(s) origins whose known robots.txt Disallow rules may be overridden.
+    /// Empty by default. Does not bypass robots fetch failures, delays or HTTP denials.
+    #[serde(default)]
+    pub robots_override_origins: Vec<String>,
     /// Requests in flight across all hosts. Each host still gets at most one.
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
@@ -151,8 +155,11 @@ fn default_retry_backoff_ms() -> u64 {
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self> {
-        let config: Config = toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
+        let mut config: Config = toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
         config.validate()?;
+        for origin in &mut config.crawler.robots_override_origins {
+            *origin = urlnorm::origin(&url::Url::parse(origin).expect("validated origin"));
+        }
         Ok(config)
     }
 
@@ -177,6 +184,23 @@ impl Config {
             return Err(Error::Config(
                 "crawler.max_concurrency and crawler.max_attempts must be at least 1".into(),
             ));
+        }
+        for origin in &c.robots_override_origins {
+            let valid = url::Url::parse(origin).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && !origin.contains('*')
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            });
+            if !valid {
+                return Err(Error::Config(
+                    "crawler.robots_override_origins entries must be exact http(s) origins (scheme, host and optional port), without credentials, paths, queries, fragments or wildcards".into(),
+                ));
+            }
         }
         if self.sources.is_empty() {
             return Err(Error::Config("add at least one [[source]]".into()));
@@ -284,6 +308,44 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )
         );
+    }
+
+    #[test]
+    fn robots_override_is_empty_by_default_and_normalizes_exact_origins() {
+        let default = Config::from_toml(MINIMAL).unwrap();
+        assert!(default.crawler.robots_override_origins.is_empty());
+        let text = MINIMAL.replace(
+            "[crawler]",
+            "[crawler]\nrobots_override_origins = [\"https://EXAMPLE.org:443/\", \"http://localhost:8080\"]",
+        );
+        let cfg = Config::from_toml(&text).unwrap();
+        assert_eq!(
+            cfg.crawler.robots_override_origins,
+            ["https://example.org", "http://localhost:8080"]
+        );
+    }
+
+    #[test]
+    fn robots_override_rejects_non_origins() {
+        for origin in [
+            "*",
+            "https://*.example.org",
+            "example.org",
+            "ftp://example.org",
+            "https://user:password@example.org",
+            "https://example.org/private",
+            "https://example.org/?all=true",
+            "https://example.org/#all",
+        ] {
+            let text = MINIMAL.replace(
+                "[crawler]",
+                &format!("[crawler]\nrobots_override_origins = [\"{origin}\"]"),
+            );
+            assert!(
+                matches!(Config::from_toml(&text), Err(Error::Config(m)) if m.contains("robots_override_origins")),
+                "accepted {origin}"
+            );
+        }
     }
 
     #[test]
